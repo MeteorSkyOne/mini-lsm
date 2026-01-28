@@ -103,6 +103,13 @@ impl MemTable {
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
         let map = Arc::clone(&self.map);
         map.insert(Bytes::copy_from_slice(_key), Bytes::copy_from_slice(_value));
+        let size = self
+            .approximate_size
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.approximate_size.store(
+            size + _key.len() + _value.len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Ok(())
     }
 
@@ -113,6 +120,13 @@ impl MemTable {
             map.insert(
                 Bytes::copy_from_slice(key.raw_ref()),
                 Bytes::copy_from_slice(value),
+            );
+            let size = self
+                .approximate_size
+                .load(std::sync::atomic::Ordering::Relaxed);
+            self.approximate_size.store(
+                size + key.raw_ref().len() + value.len(),
+                std::sync::atomic::Ordering::Relaxed,
             );
         }
         Ok(())
