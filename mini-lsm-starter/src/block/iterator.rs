@@ -12,10 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use crate::key::{KeySlice, KeyVec};
 
@@ -48,44 +45,141 @@ impl BlockIterator {
 
     /// Creates a block iterator and seek to the first entry.
     pub fn create_and_seek_to_first(block: Arc<Block>) -> Self {
-        unimplemented!()
+        let mut iterator = Self::new(block);
+        iterator.seek_to_first();
+        iterator
     }
 
     /// Creates a block iterator and seek to the first key that >= `key`.
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
-        unimplemented!()
+        let mut iterator = Self::new(block);
+        iterator.seek_to_key(key);
+        iterator
     }
 
     /// Returns the key of the current entry.
-    pub fn key(&self) -> KeySlice {
-        unimplemented!()
+    pub fn key(&self) -> KeySlice<'_> {
+        self.key.as_key_slice()
     }
 
     /// Returns the value of the current entry.
     pub fn value(&self) -> &[u8] {
-        unimplemented!()
+        &self.block.data[self.value_range.0..self.value_range.1]
     }
 
     /// Returns true if the iterator is valid.
     /// Note: You may want to make use of `key`
     pub fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.idx < self.block.offsets.len()
     }
 
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
-        unimplemented!()
+        self.idx = 0;
+        let key0_offset = self.block.offsets[0];
+        let key_len = u16::from_le_bytes([
+            self.block.data[key0_offset as usize],
+            self.block.data[(key0_offset + 1) as usize],
+        ]) as usize;
+
+        let value0_offset = key0_offset + 2 + key_len as u16;
+        self.key = KeyVec::from_vec(
+            self.block.data
+                [(key0_offset + 2) as usize..(key0_offset + 2 + key_len as u16) as usize]
+                .to_vec(),
+        );
+        let value_len = u16::from_le_bytes([
+            self.block.data[value0_offset as usize],
+            self.block.data[(value0_offset + 1) as usize],
+        ]) as usize;
+        self.value_range = (
+            (value0_offset + 2) as usize,
+            (value0_offset + 2 + value_len as u16) as usize,
+        );
+        self.first_key = self.key.clone();
     }
 
     /// Move to the next key in the block.
     pub fn next(&mut self) {
-        unimplemented!()
+        self.idx += 1;
+        if self.idx >= self.block.offsets.len() {
+            self.key = KeyVec::new();
+            self.value_range = (0, 0);
+            return;
+        }
+        let key_offset = self.block.offsets[self.idx];
+        let key_len = u16::from_le_bytes([
+            self.block.data[key_offset as usize],
+            self.block.data[(key_offset + 1) as usize],
+        ]) as usize;
+        let value_offset = key_offset + 2 + key_len as u16;
+        let value_len = u16::from_le_bytes([
+            self.block.data[value_offset as usize],
+            self.block.data[(value_offset + 1) as usize],
+        ]) as usize;
+        self.value_range = (
+            (value_offset + 2) as usize,
+            (value_offset + 2 + value_len as u16) as usize,
+        );
+        self.key = KeyVec::from_vec(
+            self.block.data[(key_offset + 2) as usize..(key_offset + 2 + key_len as u16) as usize]
+                .to_vec(),
+        );
+        self.first_key = self.key.clone();
     }
 
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        unimplemented!()
+        let len = self.block.offsets.len();
+        if len == 0 {
+            self.idx = 0;
+            self.key = KeyVec::new();
+            self.value_range = (0, 0);
+            return;
+        }
+
+        let target = key.to_key_vec();
+        // lower_bound: find the first index i such that key[i] >= target.
+        let mut low: usize = 0;
+        let mut high: usize = len; // exclusive
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let key_offset = self.block.offsets[mid] as usize;
+            let key_len =
+                u16::from_le_bytes([self.block.data[key_offset], self.block.data[key_offset + 1]])
+                    as usize;
+            let mid_key = KeyVec::from_vec(
+                self.block.data[key_offset + 2..key_offset + 2 + key_len].to_vec(),
+            );
+
+            match mid_key.cmp(&target) {
+                Ordering::Less => low = mid + 1,
+                Ordering::Greater | Ordering::Equal => high = mid,
+            }
+        }
+
+        self.idx = low;
+        if self.idx >= len {
+            self.key = KeyVec::new();
+            self.value_range = (0, 0);
+            return;
+        }
+
+        // Refresh iterator state to the entry at `self.idx`.
+        let key_offset = self.block.offsets[self.idx] as usize;
+        let key_len =
+            u16::from_le_bytes([self.block.data[key_offset], self.block.data[key_offset + 1]])
+                as usize;
+        self.key =
+            KeyVec::from_vec(self.block.data[key_offset + 2..key_offset + 2 + key_len].to_vec());
+
+        let value_offset = key_offset + 2 + key_len;
+        let value_len = u16::from_le_bytes([
+            self.block.data[value_offset],
+            self.block.data[value_offset + 1],
+        ]) as usize;
+        self.value_range = (value_offset + 2, value_offset + 2 + value_len);
     }
 }
