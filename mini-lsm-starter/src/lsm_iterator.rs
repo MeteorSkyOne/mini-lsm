@@ -16,6 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use anyhow::Result;
+use nom::Err;
 
 use crate::{
     iterators::{StorageIterator, merge_iterator::MergeIterator},
@@ -27,11 +28,31 @@ type LsmIteratorInner = MergeIterator<MemTableIterator>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
+    is_valid: bool,
 }
 
 impl LsmIterator {
     pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
-        Ok(Self { inner: iter })
+        let mut iter = Self {
+            is_valid: iter.is_valid(),
+            inner: iter,
+        };
+        iter.skip_tombstones()?;
+        Ok(iter)
+    }
+
+    fn advance_inner(&mut self) -> Result<()> {
+        self.inner.next()?;
+        self.is_valid = self.inner.is_valid();
+        Ok(())
+    }
+
+    /// Skip entries whose value is empty (tombstones).
+    fn skip_tombstones(&mut self) -> Result<()> {
+        while self.is_valid && self.inner.value().is_empty() {
+            self.advance_inner()?;
+        }
+        Ok(())
     }
 }
 
@@ -39,19 +60,23 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.is_valid
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.key().raw_ref()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if !self.is_valid {
+            return Ok(());
+        }
+        self.advance_inner()?;
+        self.skip_tombstones()
     }
 }
 
@@ -79,18 +104,28 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         Self: 'a;
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.has_errored && self.iter.is_valid()
     }
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        self.iter.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.iter.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if self.has_errored {
+            Err(anyhow::anyhow!("Iterator has already errored"))
+        } else {
+            match self.iter.next() {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    self.has_errored = true;
+                    Err(e)
+                }
+            }
+        }
     }
 }

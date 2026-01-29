@@ -59,7 +59,20 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        // Filter out invalid iterators to avoid calling `key()` on them when maintaining the heap.
+        let mut iters = iters
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, iter)| {
+                if iter.is_valid() {
+                    Some(HeapWrapper(i, iter))
+                } else {
+                    None
+                }
+            })
+            .collect::<BinaryHeap<_>>();
+        let current = iters.pop().map(|wrapper| HeapWrapper(wrapper.0, wrapper.1));
+        Self { iters, current }
     }
 }
 
@@ -68,19 +81,64 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
 {
     type KeyType<'a> = KeySlice<'a>;
 
-    fn key(&self) -> KeySlice {
-        unimplemented!()
+    fn key(&'_ self) -> KeySlice<'_> {
+        self.current
+            .as_ref()
+            .map_or(KeySlice::from_slice(&[]), |current| current.1.key())
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current
+            .as_ref()
+            .map_or(&[], |current| current.1.value())
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current
+            .as_ref()
+            .map_or(false, |current| current.1.is_valid())
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let Some(mut current) = self.current.take() else {
+            return Ok(());
+        };
+
+        // If `current` is already invalid, just select the next valid iterator from the heap.
+        if !current.1.is_valid() {
+            self.current = self.iters.pop();
+            return Ok(());
+        }
+
+        // Own the key because advancing iterators may invalidate borrowed slices.
+        let current_key = current.1.key().to_key_vec();
+        let current_key_slice = current_key.as_key_slice();
+
+        // Advance and reinsert all iterators whose key equals current key (they should be skipped).
+        loop {
+            let should_advance = match self.iters.peek() {
+                Some(top) => top.1.key() == current_key_slice,
+                None => false,
+            };
+            if !should_advance {
+                break;
+            }
+
+            let mut dup = self.iters.pop().expect("peek() returned Some");
+            dup.1.next()?;
+            if dup.1.is_valid() {
+                self.iters.push(dup);
+            }
+        }
+
+        // Advance current iterator itself and reinsert if still valid.
+        current.1.next()?;
+        if current.1.is_valid() {
+            self.iters.push(current);
+        }
+
+        // Select the new current iterator.
+        self.current = self.iters.pop();
+        Ok(())
     }
 }
