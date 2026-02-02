@@ -79,4 +79,8 @@ impl BlockBuilder {
             data: self.data,
         }
     }
+
+    pub fn first_key(&self) -> &KeyVec {
+        &self.first_key
+    }
 }
