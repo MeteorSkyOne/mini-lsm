@@ -12,40 +12,75 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ops::Bound;
+
 use anyhow::Result;
+use bytes::Bytes;
 
 use crate::{
-    iterators::{StorageIterator, merge_iterator::MergeIterator},
+    iterators::{
+        StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
+    },
     mem_table::MemTableIterator,
+    table::SsTableIterator,
 };
 
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
-type LsmIteratorInner = MergeIterator<MemTableIterator>;
+type LsmIteratorInner =
+    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
     is_valid: bool,
+    end_bound: Bound<Bytes>,
+    reach_bound: bool,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
+    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
         let mut iter = Self {
             is_valid: iter.is_valid(),
             inner: iter,
+            end_bound,
+            reach_bound: false,
         };
         iter.skip_tombstones()?;
         Ok(iter)
     }
 
     fn advance_inner(&mut self) -> Result<()> {
-        self.inner.next()?;
-        self.is_valid = self.inner.is_valid();
+        self.check_end_bound();
+        if !self.reach_bound {
+            self.inner.next()?;
+            self.is_valid = self.inner.is_valid();
+        }
         Ok(())
+    }
+
+    /// Mark iterator as invalid if current key is out of `end_bound`.
+    fn check_end_bound(&mut self) {
+        if self.reach_bound {
+            return;
+        }
+
+        match &self.end_bound {
+            Bound::Unbounded => {}
+            Bound::Included(end) => {
+                if self.inner.key().raw_ref() > end.as_ref() {
+                    self.reach_bound = true;
+                }
+            }
+            Bound::Excluded(end) => {
+                if self.inner.key().raw_ref() >= end.as_ref() {
+                    self.reach_bound = true;
+                }
+            }
+        }
     }
 
     /// Skip entries whose value is empty (tombstones).
     fn skip_tombstones(&mut self) -> Result<()> {
-        while self.is_valid && self.inner.value().is_empty() {
+        while !self.reach_bound && self.is_valid && self.inner.value().is_empty() {
             self.advance_inner()?;
         }
         Ok(())
@@ -56,7 +91,7 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        self.is_valid
+        !self.reach_bound && self.is_valid
     }
 
     fn key(&self) -> &[u8] {
@@ -68,7 +103,7 @@ impl StorageIterator for LsmIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        if !self.is_valid {
+        if self.reach_bound || !self.is_valid {
             return Ok(());
         }
         self.advance_inner()?;

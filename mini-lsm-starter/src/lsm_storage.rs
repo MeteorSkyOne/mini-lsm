@@ -30,12 +30,16 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
+use crate::mem_table::map_bound;
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -299,16 +303,67 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        let v = self.state.read().memtable.get(_key);
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+
+        let v = snapshot.memtable.get(_key);
         if let Some(v) = v {
             return if !v.is_empty() { Ok(Some(v)) } else { Ok(None) };
         }
-        for imm_memtable in &self.state.read().imm_memtables {
+        for imm_memtable in &snapshot.imm_memtables {
             let v = imm_memtable.get(_key);
             if let Some(v) = v {
                 return if !v.is_empty() { Ok(Some(v)) } else { Ok(None) };
             }
         }
+
+        // L0 SSTs (latest to earliest).
+        for id in &snapshot.l0_sstables {
+            let Some(sst) = snapshot.sstables.get(id) else {
+                continue;
+            };
+            // Fast range check based on SST metadata.
+            if sst.first_key().raw_ref() > _key || sst.last_key().raw_ref() < _key {
+                continue;
+            }
+            let iter = SsTableIterator::create_and_seek_to_key(
+                Arc::clone(sst),
+                KeySlice::from_slice(_key),
+            )?;
+            if iter.is_valid() && iter.key().raw_ref() == _key {
+                return if !iter.value().is_empty() {
+                    Ok(Some(Bytes::copy_from_slice(iter.value())))
+                } else {
+                    Ok(None)
+                };
+            }
+        }
+
+        // Leveled SSTs (L1..Lmax), newer levels first.
+        for (_level, files) in &snapshot.levels {
+            for id in files {
+                let Some(sst) = snapshot.sstables.get(id) else {
+                    continue;
+                };
+                if sst.first_key().raw_ref() > _key || sst.last_key().raw_ref() < _key {
+                    continue;
+                }
+                let iter = SsTableIterator::create_and_seek_to_key(
+                    Arc::clone(sst),
+                    KeySlice::from_slice(_key),
+                )?;
+                if iter.is_valid() && iter.key().raw_ref() == _key {
+                    return if !iter.value().is_empty() {
+                        Ok(Some(Bytes::copy_from_slice(iter.value())))
+                    } else {
+                        Ok(None)
+                    };
+                }
+            }
+        }
+
         Ok(None)
     }
 
@@ -406,9 +461,41 @@ impl LsmStorageInner {
         for mem in snapshot.imm_memtables.iter() {
             iters.push(Box::new(mem.scan(_lower.clone(), _upper.clone())));
         }
+        let mem_iter = MergeIterator::create(iters);
 
+        let sst_iters = snapshot
+            .l0_sstables
+            .iter()
+            .map(|id| {
+                let sst = snapshot
+                    .sstables
+                    .get(id)
+                    .ok_or(anyhow::anyhow!("SST not found"))?;
+
+                let iter = match _lower {
+                    Bound::Unbounded => SsTableIterator::create_and_seek_to_first(Arc::clone(sst))?,
+                    Bound::Included(k) => SsTableIterator::create_and_seek_to_key(
+                        Arc::clone(sst),
+                        KeySlice::from_slice(k),
+                    )?,
+                    Bound::Excluded(k) => {
+                        let mut it = SsTableIterator::create_and_seek_to_key(
+                            Arc::clone(sst),
+                            KeySlice::from_slice(k),
+                        )?;
+                        if it.is_valid() && it.key().raw_ref() == k {
+                            it.next()?;
+                        }
+                        it
+                    }
+                };
+                Ok(Box::new(iter))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let sst_iter = MergeIterator::create(sst_iters);
         Ok(FusedIterator::new(LsmIterator::new(
-            MergeIterator::create(iters),
+            TwoMergeIterator::create(mem_iter, sst_iter)?,
+            map_bound(_upper),
         )?))
     }
 }

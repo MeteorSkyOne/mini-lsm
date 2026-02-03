@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use anyhow::Result;
+
+use std::cmp;
 
 use super::StorageIterator;
 
@@ -25,6 +24,7 @@ pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     a: A,
     b: B,
     // Add fields as need
+    current: bool, // true if current iterator is a, false if current iterator is b
 }
 
 impl<
@@ -32,8 +32,26 @@ impl<
     B: 'static + for<'a> StorageIterator<KeyType<'a> = A::KeyType<'a>>,
 > TwoMergeIterator<A, B>
 {
+    fn select_current(&mut self) {
+        let a_valid = self.a.is_valid();
+        let b_valid = self.b.is_valid();
+
+        self.current = match (a_valid, b_valid) {
+            (true, true) => self.a.key().cmp(&self.b.key()) != cmp::Ordering::Greater,
+            (true, false) => true,
+            (false, true) => false,
+            (false, false) => self.current,
+        };
+    }
+
     pub fn create(a: A, b: B) -> Result<Self> {
-        unimplemented!()
+        let mut iter = Self {
+            a,
+            b,
+            current: true,
+        };
+        iter.select_current();
+        Ok(iter)
     }
 }
 
@@ -45,18 +63,73 @@ impl<
     type KeyType<'a> = A::KeyType<'a>;
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        if self.current {
+            if self.a.is_valid() {
+                self.a.key()
+            } else {
+                self.b.key()
+            }
+        } else {
+            if self.b.is_valid() {
+                self.b.key()
+            } else {
+                self.a.key()
+            }
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if self.current {
+            if self.a.is_valid() {
+                self.a.value()
+            } else {
+                self.b.value()
+            }
+        } else {
+            if self.b.is_valid() {
+                self.b.value()
+            } else {
+                self.a.value()
+            }
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.a.is_valid() || self.b.is_valid()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let a_valid = self.a.is_valid();
+        let b_valid = self.b.is_valid();
+        if !a_valid && !b_valid {
+            return Ok(());
+        }
+
+        match (a_valid, b_valid) {
+            (true, true) => {
+                // Compare before advancing to avoid using borrowed keys after calling `next`.
+                let ordering = self.a.key().cmp(&self.b.key());
+                if ordering == cmp::Ordering::Greater {
+                    // B has smaller key.
+                    self.b.next()?;
+                } else {
+                    // A has smaller (or equal) key; when equal, prefer A but must skip B's duplicate.
+                    self.a.next()?;
+                    if ordering == cmp::Ordering::Equal && self.b.is_valid() {
+                        self.b.next()?;
+                    }
+                }
+            }
+            (true, false) => {
+                self.a.next()?;
+            }
+            (false, true) => {
+                self.b.next()?;
+            }
+            (false, false) => {}
+        }
+
+        self.select_current();
+        Ok(())
     }
 }
