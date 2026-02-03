@@ -132,4 +132,12 @@ impl<
         self.select_current();
         Ok(())
     }
+
+    fn num_active_iterators(&self) -> usize {
+        if self.current {
+            self.a.num_active_iterators()
+        } else {
+            self.b.num_active_iterators()
+        }
+    }
 }

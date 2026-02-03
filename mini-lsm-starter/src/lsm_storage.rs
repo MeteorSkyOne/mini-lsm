@@ -39,7 +39,7 @@ use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
 use crate::mem_table::map_bound;
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -174,7 +174,25 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        // Stop background threads first.
+        //
+        // Ignore send errors here: if the receiver side is already dropped (thread already exited),
+        // close should still succeed.
+        self.compaction_notifier.send(()).ok();
+        self.flush_notifier.send(()).ok();
+
+        // Wait for background threads to exit. `take()` makes `close()` idempotent.
+        if let Some(handle) = self.compaction_thread.lock().take() {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("compaction thread panicked"))?;
+        }
+        if let Some(handle) = self.flush_thread.lock().take() {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("flush thread panicked"))?;
+        }
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -261,6 +279,18 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
+        // `path` is treated as a directory throughout the codebase (e.g. `path/00001.sst`).
+        // Ensure it exists before creating any SST/WAL/manifest files.
+        if path.exists() {
+            if !path.is_dir() {
+                return Err(anyhow::anyhow!(
+                    "storage path must be a directory, but got a non-directory path: {}",
+                    path.display()
+                ));
+            }
+        } else {
+            std::fs::create_dir_all(path)?;
+        }
         let state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
@@ -417,7 +447,10 @@ impl LsmStorageInner {
     }
 
     pub(super) fn sync_dir(&self) -> Result<()> {
-        unimplemented!()
+        // Best-effort directory fsync for durability (POSIX).
+        // On Linux, directories can be opened and `sync_all()` will flush metadata (e.g., new files).
+        std::fs::File::open(&self.path)?.sync_all()?;
+        Ok(())
     }
 
     /// Force freeze the current memtable to an immutable memtable
@@ -434,12 +467,107 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+        let memtable_to_flush;
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+        memtable_to_flush = snapshot.imm_memtables.last();
+        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+        memtable_to_flush
+            .ok_or(anyhow::anyhow!("no imm memtables!"))?
+            .flush(&mut sst_builder)?;
+        let sst = sst_builder.build(
+            self.next_sst_id(),
+            Some(self.block_cache.clone()),
+            &self.path_of_sst(self.next_sst_id()),
+        )?;
+
+        let mut state = self.state.write();
+        let mut new_state = (**state).clone();
+        new_state.imm_memtables.pop();
+        new_state.l0_sstables.insert(0, sst.sst_id());
+        new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
+        *state = Arc::new(new_state);
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
         // no-op
         Ok(())
+    }
+
+    fn sstable_overlaps_bounds(
+        sst_first: &[u8],
+        sst_last: &[u8],
+        lower: &Bound<&[u8]>,
+        upper: &Bound<&[u8]>,
+    ) -> bool {
+        // If scan lower bound is after the SST's last key, it cannot overlap.
+        let no_overlap_lower = match lower {
+            Bound::Unbounded => false,
+            Bound::Included(k) => *k > sst_last,
+            Bound::Excluded(k) => *k >= sst_last,
+        };
+        if no_overlap_lower {
+            return false;
+        }
+
+        // If scan upper bound is before the SST's first key, it cannot overlap.
+        let no_overlap_upper = match upper {
+            Bound::Unbounded => false,
+            Bound::Included(k) => *k < sst_first,
+            Bound::Excluded(k) => *k <= sst_first,
+        };
+        !no_overlap_upper
+    }
+
+    fn create_sstable_iterator_for_scan(
+        sst: Arc<SsTable>,
+        lower: &Bound<&[u8]>,
+    ) -> Result<SsTableIterator> {
+        let iter = match lower {
+            Bound::Unbounded => SsTableIterator::create_and_seek_to_first(sst)?,
+            Bound::Included(k) => {
+                SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(k))?
+            }
+            Bound::Excluded(k) => {
+                let mut it = SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(k))?;
+                if it.is_valid() && it.key().raw_ref() == *k {
+                    it.next()?;
+                }
+                it
+            }
+        };
+        Ok(iter)
+    }
+
+    fn build_l0_sstable_iters_for_scan(
+        snapshot: &LsmStorageState,
+        lower: &Bound<&[u8]>,
+        upper: &Bound<&[u8]>,
+    ) -> Result<Vec<Box<SsTableIterator>>> {
+        let mut iters = Vec::new();
+        for id in snapshot.l0_sstables.iter() {
+            let sst = snapshot
+                .sstables
+                .get(id)
+                .ok_or(anyhow::anyhow!("SST not found"))?;
+
+            if !Self::sstable_overlaps_bounds(
+                sst.first_key().raw_ref(),
+                sst.last_key().raw_ref(),
+                lower,
+                upper,
+            ) {
+                continue;
+            }
+
+            let iter = Self::create_sstable_iterator_for_scan(Arc::clone(sst), lower)?;
+            iters.push(Box::new(iter));
+        }
+        Ok(iters)
     }
 
     /// Create an iterator over a range of keys.
@@ -463,35 +591,10 @@ impl LsmStorageInner {
         }
         let mem_iter = MergeIterator::create(iters);
 
-        let sst_iters = snapshot
-            .l0_sstables
-            .iter()
-            .map(|id| {
-                let sst = snapshot
-                    .sstables
-                    .get(id)
-                    .ok_or(anyhow::anyhow!("SST not found"))?;
-
-                let iter = match _lower {
-                    Bound::Unbounded => SsTableIterator::create_and_seek_to_first(Arc::clone(sst))?,
-                    Bound::Included(k) => SsTableIterator::create_and_seek_to_key(
-                        Arc::clone(sst),
-                        KeySlice::from_slice(k),
-                    )?,
-                    Bound::Excluded(k) => {
-                        let mut it = SsTableIterator::create_and_seek_to_key(
-                            Arc::clone(sst),
-                            KeySlice::from_slice(k),
-                        )?;
-                        if it.is_valid() && it.key().raw_ref() == k {
-                            it.next()?;
-                        }
-                        it
-                    }
-                };
-                Ok(Box::new(iter))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // SST range filter: only create iterators for SSTs whose key ranges overlap with the scan
+        // bounds. This is required so that `num_active_iterators()` reflects the effective fan-in
+        // for scans that are known-empty from table metadata (week 1 day 6 task 3).
+        let sst_iters = Self::build_l0_sstable_iters_for_scan(&snapshot, &_lower, &_upper)?;
         let sst_iter = MergeIterator::create(sst_iters);
         Ok(FusedIterator::new(LsmIterator::new(
             TwoMergeIterator::create(mem_iter, sst_iter)?,

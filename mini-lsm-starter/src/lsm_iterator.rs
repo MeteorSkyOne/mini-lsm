@@ -45,21 +45,33 @@ impl LsmIterator {
             reach_bound: false,
         };
         iter.skip_tombstones()?;
+        // Ensure the initial position respects `end_bound` as well, so callers observing the
+        // iterator without calling `next()` (e.g., checking `is_valid()` immediately) still see an
+        // empty iterator when the range is known to be out of bound.
+        iter.check_end_bound();
         Ok(iter)
     }
 
     fn advance_inner(&mut self) -> Result<()> {
         self.check_end_bound();
-        if !self.reach_bound {
-            self.inner.next()?;
-            self.is_valid = self.inner.is_valid();
+        if self.reach_bound {
+            return Ok(());
         }
+
+        self.inner.next()?;
+        self.is_valid = self.inner.is_valid();
+        // `inner.next()` may move the iterator past `end_bound`. Check again so that the iterator
+        // becomes invalid immediately after advancing beyond the bound.
+        self.check_end_bound();
         Ok(())
     }
 
     /// Mark iterator as invalid if current key is out of `end_bound`.
     fn check_end_bound(&mut self) {
         if self.reach_bound {
+            return;
+        }
+        if !self.inner.is_valid() {
             return;
         }
 
@@ -108,6 +120,10 @@ impl StorageIterator for LsmIterator {
         }
         self.advance_inner()?;
         self.skip_tombstones()
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.inner.num_active_iterators()
     }
 }
 
@@ -158,5 +174,9 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
                 }
             }
         }
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.iter.num_active_iterators()
     }
 }
