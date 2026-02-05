@@ -152,31 +152,50 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        // Read the last u32 as the meta offset (little-endian).
+        // Read the last two u32 values as the meta offset and bloom offset (little-endian).
         let file_size = file.size();
-        if file_size < 4 {
+        if file_size < 8 {
             return Err(anyhow::anyhow!(
                 "sstable file too small: {} bytes",
                 file_size
             ));
         }
-        let footer = file.read(file_size - 4, 4)?;
-        let footer_bytes: [u8; 4] = footer
+        let footer = file.read(file_size - 8, 8)?;
+        let footer_bytes: [u8; 8] = footer
             .as_slice()
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid sstable footer length"))?;
-        let block_meta_offset_u32 = u32::from_le_bytes(footer_bytes) as u64;
-        if block_meta_offset_u32 > file_size - 4 {
+        let block_meta_offset_u32 = u32::from_le_bytes(
+            footer_bytes[0..4]
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid block meta offset encoding"))?,
+        ) as u64;
+        let bloom_offset_u32 = u32::from_le_bytes(
+            footer_bytes[4..8]
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid bloom offset encoding"))?,
+        ) as u64;
+        if block_meta_offset_u32 > file_size - 8 || bloom_offset_u32 > file_size - 8 {
             return Err(anyhow::anyhow!(
-                "invalid block meta offset {} (file size {})",
+                "invalid offsets meta {} bloom {} (file size {})",
                 block_meta_offset_u32,
+                bloom_offset_u32,
                 file_size
             ));
         }
         let block_meta_offset = block_meta_offset_u32 as usize;
+        let bloom_offset = bloom_offset_u32 as usize;
+        if bloom_offset < block_meta_offset {
+            return Err(anyhow::anyhow!(
+                "bloom offset {} before block meta offset {}",
+                bloom_offset,
+                block_meta_offset
+            ));
+        }
+
         let mut block_meta_buf = Bytes::from(file.read(
             block_meta_offset as u64,
-            file_size - block_meta_offset as u64 - 4,
+            bloom_offset as u64 - block_meta_offset as u64,
         )?);
         let block_meta = BlockMeta::decode_block_meta(&mut block_meta_buf);
         let first_key = KeyBytes::from_bytes(Bytes::from(
@@ -195,6 +214,16 @@ impl SsTable {
                 .raw_ref()
                 .to_vec(),
         ));
+
+        // Decode bloom filter if present.
+        let bloom_len = file_size as usize - bloom_offset - 8;
+        let bloom = if bloom_len > 0 {
+            let bloom_buf = file.read(bloom_offset as u64, bloom_len as u64)?;
+            Some(Bloom::decode(&bloom_buf)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             file,
             block_meta,
@@ -203,7 +232,7 @@ impl SsTable {
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom,
             max_ts: 0,
         })
     }

@@ -358,6 +358,12 @@ impl LsmStorageInner {
             if sst.first_key().raw_ref() > _key || sst.last_key().raw_ref() < _key {
                 continue;
             }
+
+            if let Some(bloom) = &sst.bloom {
+                if !bloom.may_contain(farmhash::fingerprint32(_key)) {
+                    continue;
+                }
+            }
             let iter = SsTableIterator::create_and_seek_to_key(
                 Arc::clone(sst),
                 KeySlice::from_slice(_key),

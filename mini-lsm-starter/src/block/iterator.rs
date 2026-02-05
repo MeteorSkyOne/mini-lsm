@@ -76,6 +76,12 @@ impl BlockIterator {
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
         self.idx = 0;
+        if self.block.offsets.is_empty() {
+            self.key = KeyVec::new();
+            self.value_range = (0, 0);
+            self.first_key = KeyVec::new();
+            return;
+        }
         let key0_offset = self.block.offsets[0];
         let key_len = u16::from_le_bytes([
             self.block.data[key0_offset as usize],
@@ -97,6 +103,26 @@ impl BlockIterator {
             (value0_offset + 2 + value_len as u16) as usize,
         );
         self.first_key = self.key.clone();
+    }
+
+    fn decompress_key(&self, data: &[u8]) -> KeyVec {
+        if data.len() < 4 {
+            return KeyVec::new();
+        }
+        let prefix_len = u16::from_le_bytes([data[0], data[1]]) as usize;
+        let rest_len = u16::from_le_bytes([data[2], data[3]]) as usize;
+        if prefix_len > self.first_key.len() {
+            return KeyVec::new();
+        }
+        if 4usize.saturating_add(rest_len) > data.len() {
+            return KeyVec::new();
+        }
+        let prefix = self.first_key.raw_ref()[..prefix_len].to_vec();
+        let rest = data[4..4 + rest_len].to_vec();
+        let mut key = KeyVec::new();
+        key.append(&prefix);
+        key.append(&rest);
+        key
     }
 
     /// Move to the next key in the block.
@@ -121,11 +147,15 @@ impl BlockIterator {
             (value_offset + 2) as usize,
             (value_offset + 2 + value_len as u16) as usize,
         );
-        self.key = KeyVec::from_vec(
-            self.block.data[(key_offset + 2) as usize..(key_offset + 2 + key_len as u16) as usize]
-                .to_vec(),
-        );
-        self.first_key = self.key.clone();
+        let data = self.block.data
+            [(key_offset + 2) as usize..(key_offset + 2 + key_len as u16) as usize]
+            .to_vec();
+        if self.idx > 0 {
+            // key decompression
+            self.key = self.decompress_key(&data);
+        } else {
+            self.key = KeyVec::from_vec(data);
+        }
     }
 
     /// Seek to the first key that >= `key`.
@@ -137,7 +167,24 @@ impl BlockIterator {
             self.idx = 0;
             self.key = KeyVec::new();
             self.value_range = (0, 0);
+            self.first_key = KeyVec::new();
             return;
+        }
+
+        // Initialize `first_key` so we can correctly decompress keys during binary search.
+        if self.first_key.is_empty() {
+            let key0_offset = self.block.offsets[0] as usize;
+            if key0_offset + 2 <= self.block.data.len() {
+                let key0_len = u16::from_le_bytes([
+                    self.block.data[key0_offset],
+                    self.block.data[key0_offset + 1],
+                ]) as usize;
+                let start = key0_offset + 2;
+                let end = start.saturating_add(key0_len);
+                if end <= self.block.data.len() {
+                    self.first_key = KeyVec::from_vec(self.block.data[start..end].to_vec());
+                }
+            }
         }
 
         let target = key.to_key_vec();
@@ -150,9 +197,12 @@ impl BlockIterator {
             let key_len =
                 u16::from_le_bytes([self.block.data[key_offset], self.block.data[key_offset + 1]])
                     as usize;
-            let mid_key = KeyVec::from_vec(
-                self.block.data[key_offset + 2..key_offset + 2 + key_len].to_vec(),
-            );
+            let mid_key_bytes = self.block.data[key_offset + 2..key_offset + 2 + key_len].to_vec();
+            let mid_key = if mid > 0 {
+                self.decompress_key(&mid_key_bytes)
+            } else {
+                KeyVec::from_vec(mid_key_bytes)
+            };
 
             match mid_key.cmp(&target) {
                 Ordering::Less => low = mid + 1,
@@ -172,8 +222,12 @@ impl BlockIterator {
         let key_len =
             u16::from_le_bytes([self.block.data[key_offset], self.block.data[key_offset + 1]])
                 as usize;
-        self.key =
-            KeyVec::from_vec(self.block.data[key_offset + 2..key_offset + 2 + key_len].to_vec());
+        let data = self.block.data[key_offset + 2..key_offset + 2 + key_len].to_vec();
+        if self.idx > 0 {
+            self.key = self.decompress_key(&data);
+        } else {
+            self.key = KeyVec::from_vec(data);
+        }
 
         let value_offset = key_offset + 2 + key_len;
         let value_len = u16::from_le_bytes([

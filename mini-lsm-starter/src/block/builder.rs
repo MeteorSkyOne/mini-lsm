@@ -50,15 +50,30 @@ impl BlockBuilder {
         if self.offsets.len() > 0 && self.data.len() + entry_size + 2 > self.block_size {
             return false;
         }
-        if self.offsets.is_empty() {
-            self.first_key = key.to_key_vec();
-        }
+        let is_first = self.offsets.is_empty();
         // append offset
         self.offsets.push(self.data.len() as u16);
-        // append key_len
-        self.data.extend_from_slice(&(key_len as u16).to_le_bytes());
-        // append key
-        self.data.extend_from_slice(key.raw_ref());
+
+        if is_first {
+            self.first_key = key.to_key_vec();
+            // append key_len
+            self.data.extend_from_slice(&(key_len as u16).to_le_bytes());
+            // append key
+            self.data.extend_from_slice(key.raw_ref());
+        } else {
+            let common_prefix_len = self.first_key.common_prefix_len(&key);
+            let rest_len = key.len() - common_prefix_len;
+            // new key = common_prefix + rest_len + key
+            let mut new_key = KeyVec::new();
+            new_key.append(&(common_prefix_len as u16).to_le_bytes());
+            new_key.append(&(rest_len as u16).to_le_bytes());
+            new_key.append(&key.raw_ref()[common_prefix_len..]);
+            // append key_len(u16 + u16 + rest_len)
+            self.data
+                .extend_from_slice(&(4 + rest_len as u16).to_le_bytes());
+            // append key
+            self.data.extend_from_slice(new_key.raw_ref());
+        }
         // append value_len
         self.data
             .extend_from_slice(&(value.len() as u16).to_le_bytes());

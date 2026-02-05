@@ -37,6 +37,18 @@ impl<T: AsRef<[u8]>> Key<T> {
         self.0.as_ref().is_empty()
     }
 
+    pub fn common_prefix_len(&self, other: &KeySlice) -> usize {
+        let min_len = self.len().min(other.len());
+        let mut i = 0;
+        while i < min_len {
+            if self.0.as_ref()[i] != other.0.as_ref()[i] {
+                break;
+            }
+            i += 1;
+        }
+        i
+    }
+
     pub fn for_testing_ts(self) -> u64 {
         0
     }

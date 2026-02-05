@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::{BlockMeta, SsTable};
+use super::{BlockMeta, SsTable, bloom::Bloom};
 use crate::{
     block::BlockBuilder,
     key::{KeySlice, KeyVec},
@@ -32,6 +32,7 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    key_hashes: Vec<u32>,
 }
 
 impl SsTableBuilder {
@@ -44,6 +45,7 @@ impl SsTableBuilder {
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
+            key_hashes: Vec::new(),
         }
     }
 
@@ -68,6 +70,9 @@ impl SsTableBuilder {
         if self.first_key.is_empty() {
             self.first_key = key.raw_ref().to_vec();
         }
+
+        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
+
         if self.builder.add(key, value) {
             // successfully added to the current block
             self.last_key = key.raw_ref().to_vec();
@@ -111,8 +116,22 @@ impl SsTableBuilder {
         }
         let block_meta_offset = self.data.len() as u32;
         self.data.extend_from_slice(&buf);
+
+        // Build bloom filter from all keys in this SSTable.
+        let mut bloom = None;
+        let bloom_offset = self.data.len() as u32;
+        if !self.key_hashes.is_empty() {
+            let bits_per_key = Bloom::bloom_bits_per_key(self.key_hashes.len(), 0.01);
+            let built_bloom = Bloom::build_from_key_hashes(&self.key_hashes, bits_per_key);
+            let mut bloom_buf = Vec::new();
+            built_bloom.encode(&mut bloom_buf);
+            self.data.extend_from_slice(&bloom_buf);
+            bloom = Some(built_bloom);
+        }
+
         self.data
             .extend_from_slice(&block_meta_offset.to_le_bytes());
+        self.data.extend_from_slice(&bloom_offset.to_le_bytes());
 
         let file = super::FileObject::create(path.as_ref(), self.data)?;
 
@@ -124,7 +143,7 @@ impl SsTableBuilder {
             block_cache,
             first_key: KeyVec::from_vec(self.first_key).into_key_bytes(),
             last_key: KeyVec::from_vec(self.last_key).into_key_bytes(),
-            bloom: None,
+            bloom,
             max_ts: 0,
         })
     }
