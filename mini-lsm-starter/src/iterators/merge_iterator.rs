@@ -121,7 +121,10 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
                 break;
             }
 
-            let mut dup = self.iters.pop().expect("peek() returned Some");
+            let mut dup = self
+                .iters
+                .pop()
+                .ok_or(anyhow::anyhow!("peek() returned Some"))?;
             dup.1.next()?;
             if dup.1.is_valid() {
                 self.iters.push(dup);

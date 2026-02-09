@@ -22,7 +22,7 @@ mod tiered;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
 use serde::{Deserialize, Serialize};
 pub use simple_leveled::{
@@ -30,8 +30,11 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
+use crate::iterators::StorageIterator;
+use crate::iterators::merge_iterator::MergeIterator;
+use crate::key::TS_ENABLED;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CompactionTask {
@@ -124,11 +127,122 @@ pub enum CompactionOptions {
 
 impl LsmStorageInner {
     fn compact(&self, _task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
-        unimplemented!()
+        match _task {
+            CompactionTask::ForceFullCompaction {
+                l0_sstables,
+                l1_sstables,
+            } => {
+                if l0_sstables.is_empty() && l1_sstables.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let ssts = {
+                    let state = self.state.read();
+                    l0_sstables
+                        .iter()
+                        .chain(l1_sstables.iter())
+                        .map(|sst_id| {
+                            state
+                                .sstables
+                                .get(sst_id)
+                                .cloned()
+                                .with_context(|| format!("sst {sst_id} not found"))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
+
+                let mut sst_iters = Vec::with_capacity(ssts.len());
+                for sst in &ssts {
+                    let iter = SsTableIterator::create_and_seek_to_first(sst.clone())
+                        .with_context(|| {
+                            format!("failed to create iterator for sst {}", sst.sst_id())
+                        })?;
+                    sst_iters.push(Box::new(iter));
+                }
+
+                let mut merge_iter = MergeIterator::create(sst_iters);
+                let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+                let mut new_ssts = Vec::<Arc<SsTable>>::new();
+                let mut builder_has_entries = false;
+                while merge_iter.is_valid() {
+                    let key = merge_iter.key();
+                    let value = merge_iter.value();
+
+                    // When compacting to the bottom level, we can safely drop tombstones if
+                    // timestamp is disabled (week 1 mode). With timestamp enabled, we must keep
+                    // historical versions.
+                    if !TS_ENABLED && _task.compact_to_bottom_level() && value.is_empty() {
+                        merge_iter.next()?;
+                        continue;
+                    }
+
+                    sst_builder.add(key, value);
+                    builder_has_entries = true;
+                    if sst_builder.estimated_size() >= self.options.target_sst_size {
+                        let sst_id = self.next_sst_id();
+                        let sst_path = self.path_of_sst(sst_id);
+                        let new_sst = sst_builder
+                            .build(sst_id, Some(self.block_cache.clone()), sst_path)
+                            .with_context(|| format!("failed to build sst {sst_id}"))?;
+                        new_ssts.push(Arc::new(new_sst));
+                        sst_builder = SsTableBuilder::new(self.options.block_size);
+                        builder_has_entries = false;
+                    }
+                    merge_iter.next()?;
+                }
+                if builder_has_entries {
+                    let sst_id = self.next_sst_id();
+                    let sst_path = self.path_of_sst(sst_id);
+                    let new_sst = sst_builder
+                        .build(sst_id, Some(self.block_cache.clone()), sst_path)
+                        .with_context(|| format!("failed to build sst {sst_id}"))?;
+                    new_ssts.push(Arc::new(new_sst));
+                }
+                Ok(new_ssts)
+            }
+            _ => unimplemented!(),
+        }
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
-        unimplemented!()
+        let ssts_to_compact = {
+            let state = self.state.read();
+            (state.l0_sstables.clone(), state.levels[0].1.clone())
+        };
+        let new_ssts = self.compact(&CompactionTask::ForceFullCompaction {
+            l0_sstables: ssts_to_compact.0.clone(),
+            l1_sstables: ssts_to_compact.1.clone(),
+        })?;
+        let ssts_to_compact = ssts_to_compact
+            .0
+            .iter()
+            .chain(ssts_to_compact.1.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        {
+            let _state_lock = self.state_lock.lock();
+            let mut state = self.state.write();
+            let mut new_state = (**state).clone();
+            new_state
+                .l0_sstables
+                .retain(|sst| !ssts_to_compact.contains(sst));
+            new_state.levels[0] = (1, new_ssts.iter().map(|sst| sst.sst_id()).collect()); // new SSTs added to L1
+            new_state
+                .sstables
+                .extend(new_ssts.iter().map(|sst| (sst.sst_id(), sst.clone())));
+            *state = Arc::new(new_state);
+        };
+        for sst in ssts_to_compact {
+            let path = self.path_of_sst(sst);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("failed to remove sst file {}", path.display()));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn trigger_compaction(&self) -> Result<()> {

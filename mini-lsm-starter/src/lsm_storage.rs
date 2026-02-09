@@ -31,6 +31,7 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::StorageIterator;
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::KeySlice;
@@ -484,11 +485,9 @@ impl LsmStorageInner {
         memtable_to_flush
             .ok_or(anyhow::anyhow!("no imm memtables!"))?
             .flush(&mut sst_builder)?;
-        let sst = sst_builder.build(
-            self.next_sst_id(),
-            Some(self.block_cache.clone()),
-            &self.path_of_sst(self.next_sst_id()),
-        )?;
+        let sst_id = self.next_sst_id();
+        let sst_path = self.path_of_sst(sst_id);
+        let sst = sst_builder.build(sst_id, Some(self.block_cache.clone()), sst_path)?;
 
         let mut state = self.state.write();
         let mut new_state = (**state).clone();
@@ -576,6 +575,34 @@ impl LsmStorageInner {
         Ok(iters)
     }
 
+    fn build_l1_sstables_for_scan(
+        snapshot: &LsmStorageState,
+        lower: &Bound<&[u8]>,
+        upper: &Bound<&[u8]>,
+    ) -> Result<Vec<Arc<SsTable>>> {
+        let Some((_level, files)) = snapshot.levels.first() else {
+            return Ok(Vec::new());
+        };
+
+        let mut sstables = Vec::new();
+        for id in files.iter() {
+            let sst = snapshot
+                .sstables
+                .get(id)
+                .ok_or(anyhow::anyhow!("SST not found"))?;
+            if !Self::sstable_overlaps_bounds(
+                sst.first_key().raw_ref(),
+                sst.last_key().raw_ref(),
+                lower,
+                upper,
+            ) {
+                continue;
+            }
+            sstables.push(Arc::clone(sst));
+        }
+        Ok(sstables)
+    }
+
     /// Create an iterator over a range of keys.
     pub fn scan(
         &self,
@@ -602,8 +629,29 @@ impl LsmStorageInner {
         // for scans that are known-empty from table metadata (week 1 day 6 task 3).
         let sst_iters = Self::build_l0_sstable_iters_for_scan(&snapshot, &_lower, &_upper)?;
         let sst_iter = MergeIterator::create(sst_iters);
+
+        // L1 is a set of non-overlapping SSTs, so we can use a concat iterator.
+        let l1_sstables = Self::build_l1_sstables_for_scan(&snapshot, &_lower, &_upper)?;
+        let l1_iter = match &_lower {
+            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(l1_sstables)?,
+            Bound::Included(k) => {
+                SstConcatIterator::create_and_seek_to_key(l1_sstables, KeySlice::from_slice(k))?
+            }
+            Bound::Excluded(k) => {
+                let mut it = SstConcatIterator::create_and_seek_to_key(
+                    l1_sstables,
+                    KeySlice::from_slice(k),
+                )?;
+                if it.is_valid() && it.key().raw_ref() == *k {
+                    it.next()?;
+                }
+                it
+            }
+        };
+
+        let mem_and_l0 = TwoMergeIterator::create(mem_iter, sst_iter)?;
         Ok(FusedIterator::new(LsmIterator::new(
-            TwoMergeIterator::create(mem_iter, sst_iter)?,
+            TwoMergeIterator::create(mem_and_l0, l1_iter)?,
             map_bound(_upper),
         )?))
     }
