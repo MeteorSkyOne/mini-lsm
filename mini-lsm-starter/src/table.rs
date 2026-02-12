@@ -273,7 +273,7 @@ impl SsTable {
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
         if let Some(blockcache) = self.block_cache.as_ref() {
             if let Some(block) = blockcache.get(&(self.id, block_idx)) {
-                return Ok(block.clone());
+                Ok(block.clone())
             } else {
                 let block = self.read_block(block_idx)?;
                 blockcache.insert((self.id, block_idx), block.clone());

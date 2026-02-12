@@ -603,6 +603,65 @@ impl LsmStorageInner {
         Ok(sstables)
     }
 
+    fn build_leveled_sstable_iters_for_scan(
+        snapshot: &LsmStorageState,
+        lower: &Bound<&[u8]>,
+        upper: &Bound<&[u8]>,
+    ) -> Result<Vec<Box<SstConcatIterator>>> {
+        let mut iters = Vec::new();
+
+        // L1..Lmax: within each level tables are non-overlapping, so each level can be represented
+        // by a concat iterator. Across levels tables may overlap, so we merge these concat
+        // iterators with precedence from smaller level number to larger.
+        for (_level, files) in &snapshot.levels {
+            let mut sstables = Vec::new();
+            for id in files.iter() {
+                let sst = snapshot
+                    .sstables
+                    .get(id)
+                    .ok_or(anyhow::anyhow!("SST not found"))?;
+                if !Self::sstable_overlaps_bounds(
+                    sst.first_key().raw_ref(),
+                    sst.last_key().raw_ref(),
+                    lower,
+                    upper,
+                ) {
+                    continue;
+                }
+                sstables.push(Arc::clone(sst));
+            }
+
+            if sstables.is_empty() {
+                continue;
+            }
+
+            let iter = match lower {
+                Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(sstables)?,
+                Bound::Included(k) => {
+                    SstConcatIterator::create_and_seek_to_key(sstables, KeySlice::from_slice(k))?
+                }
+                Bound::Excluded(k) => {
+                    let mut it = SstConcatIterator::create_and_seek_to_key(
+                        sstables,
+                        KeySlice::from_slice(k),
+                    )?;
+                    if it.is_valid() && it.key().raw_ref() == *k {
+                        it.next()?;
+                    }
+                    it
+                }
+            };
+
+            // `MergeIterator::create` will filter invalid iterators, but skipping them here avoids
+            // building a heap wrapper unnecessarily.
+            if iter.is_valid() {
+                iters.push(Box::new(iter));
+            }
+        }
+
+        Ok(iters)
+    }
+
     /// Create an iterator over a range of keys.
     pub fn scan(
         &self,
@@ -630,28 +689,14 @@ impl LsmStorageInner {
         let sst_iters = Self::build_l0_sstable_iters_for_scan(&snapshot, &_lower, &_upper)?;
         let sst_iter = MergeIterator::create(sst_iters);
 
-        // L1 is a set of non-overlapping SSTs, so we can use a concat iterator.
-        let l1_sstables = Self::build_l1_sstables_for_scan(&snapshot, &_lower, &_upper)?;
-        let l1_iter = match &_lower {
-            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(l1_sstables)?,
-            Bound::Included(k) => {
-                SstConcatIterator::create_and_seek_to_key(l1_sstables, KeySlice::from_slice(k))?
-            }
-            Bound::Excluded(k) => {
-                let mut it = SstConcatIterator::create_and_seek_to_key(
-                    l1_sstables,
-                    KeySlice::from_slice(k),
-                )?;
-                if it.is_valid() && it.key().raw_ref() == *k {
-                    it.next()?;
-                }
-                it
-            }
-        };
+        // L1..Lmax: each level uses concat (non-overlapping), then merge across levels.
+        let leveled_iters =
+            Self::build_leveled_sstable_iters_for_scan(&snapshot, &_lower, &_upper)?;
+        let leveled_iter = MergeIterator::create(leveled_iters);
 
         let mem_and_l0 = TwoMergeIterator::create(mem_iter, sst_iter)?;
         Ok(FusedIterator::new(LsmIterator::new(
-            TwoMergeIterator::create(mem_and_l0, l1_iter)?,
+            TwoMergeIterator::create(mem_and_l0, leveled_iter)?,
             map_bound(_upper),
         )?))
     }
