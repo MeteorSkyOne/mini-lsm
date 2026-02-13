@@ -147,10 +147,23 @@ impl LsmStorageInner {
             false,
         );
 
-        // Merge into the latest state:
-        // - `levels` can be fully replaced (flush thread only appends to L0 in this project)
-        // - `l0_sstables` must preserve SSTs flushed during compaction execution
-        state.levels = applied_state.levels;
+        // Merge into the latest state.
+        // For tiered compaction the flush thread inserts new tiers at the front of
+        // `levels` (not L0). Those tiers are absent from the snapshot so we must
+        // preserve them; otherwise the newest data is silently dropped.
+        if !self.compaction_controller.flush_to_l0() {
+            let snapshot_tier_ids: Vec<usize> = snapshot.levels.iter().map(|(id, _)| *id).collect();
+            let mut new_levels: Vec<(usize, Vec<usize>)> = state
+                .levels
+                .iter()
+                .filter(|(id, _)| !snapshot_tier_ids.contains(id))
+                .cloned()
+                .collect();
+            new_levels.extend(applied_state.levels);
+            state.levels = new_levels;
+        } else {
+            state.levels = applied_state.levels;
+        }
 
         // Apply L0 changes in an "incremental" way based on current state, so we don't drop
         // concurrently flushed SSTs.
@@ -201,6 +214,14 @@ impl LsmStorageInner {
                     task.upper_level_sst_ids
                         .iter()
                         .chain(task.lower_level_sst_ids.iter())
+                        .copied(),
+                );
+            }
+            CompactionTask::Tiered(task) => {
+                sst_ids.extend(
+                    task.tiers
+                        .iter()
+                        .flat_map(|(_, sst_ids)| sst_ids.iter())
                         .copied(),
                 );
             }

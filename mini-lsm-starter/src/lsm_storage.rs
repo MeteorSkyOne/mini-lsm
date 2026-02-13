@@ -351,30 +351,32 @@ impl LsmStorageInner {
         }
 
         // L0 SSTs (latest to earliest).
-        for id in &snapshot.l0_sstables {
-            let Some(sst) = snapshot.sstables.get(id) else {
-                continue;
-            };
-            // Fast range check based on SST metadata.
-            if sst.first_key().raw_ref() > _key || sst.last_key().raw_ref() < _key {
-                continue;
-            }
-
-            if let Some(bloom) = &sst.bloom {
-                if !bloom.may_contain(farmhash::fingerprint32(_key)) {
+        if self.compaction_controller.flush_to_l0() {
+            for id in &snapshot.l0_sstables {
+                let Some(sst) = snapshot.sstables.get(id) else {
+                    continue;
+                };
+                // Fast range check based on SST metadata.
+                if sst.first_key().raw_ref() > _key || sst.last_key().raw_ref() < _key {
                     continue;
                 }
-            }
-            let iter = SsTableIterator::create_and_seek_to_key(
-                Arc::clone(sst),
-                KeySlice::from_slice(_key),
-            )?;
-            if iter.is_valid() && iter.key().raw_ref() == _key {
-                return if !iter.value().is_empty() {
-                    Ok(Some(Bytes::copy_from_slice(iter.value())))
-                } else {
-                    Ok(None)
-                };
+
+                if let Some(bloom) = &sst.bloom {
+                    if !bloom.may_contain(farmhash::fingerprint32(_key)) {
+                        continue;
+                    }
+                }
+                let iter = SsTableIterator::create_and_seek_to_key(
+                    Arc::clone(sst),
+                    KeySlice::from_slice(_key),
+                )?;
+                if iter.is_valid() && iter.key().raw_ref() == _key {
+                    return if !iter.value().is_empty() {
+                        Ok(Some(Bytes::copy_from_slice(iter.value())))
+                    } else {
+                        Ok(None)
+                    };
+                }
             }
         }
 
@@ -492,7 +494,13 @@ impl LsmStorageInner {
         let mut state = self.state.write();
         let mut new_state = (**state).clone();
         new_state.imm_memtables.pop();
-        new_state.l0_sstables.insert(0, sst.sst_id());
+        if !self.compaction_controller.flush_to_l0() {
+            new_state
+                .levels
+                .insert(0, (sst.sst_id(), vec![sst.sst_id()]));
+        } else {
+            new_state.l0_sstables.insert(0, sst.sst_id());
+        }
         new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
         *state = Arc::new(new_state);
         Ok(())
@@ -573,34 +581,6 @@ impl LsmStorageInner {
             iters.push(Box::new(iter));
         }
         Ok(iters)
-    }
-
-    fn build_l1_sstables_for_scan(
-        snapshot: &LsmStorageState,
-        lower: &Bound<&[u8]>,
-        upper: &Bound<&[u8]>,
-    ) -> Result<Vec<Arc<SsTable>>> {
-        let Some((_level, files)) = snapshot.levels.first() else {
-            return Ok(Vec::new());
-        };
-
-        let mut sstables = Vec::new();
-        for id in files.iter() {
-            let sst = snapshot
-                .sstables
-                .get(id)
-                .ok_or(anyhow::anyhow!("SST not found"))?;
-            if !Self::sstable_overlaps_bounds(
-                sst.first_key().raw_ref(),
-                sst.last_key().raw_ref(),
-                lower,
-                upper,
-            ) {
-                continue;
-            }
-            sstables.push(Arc::clone(sst));
-        }
-        Ok(sstables)
     }
 
     fn build_leveled_sstable_iters_for_scan(
