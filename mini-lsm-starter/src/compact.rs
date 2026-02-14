@@ -140,11 +140,27 @@ impl LsmStorageInner {
         output_sst_ids: &[usize],
     ) -> Vec<usize> {
         // Always use compaction controller's apply logic to compute the intended new state.
+        //
+        // Note: some controllers (e.g. leveled) need to compare `first_key()` of *output* SSTs
+        // when sorting the target level. The `snapshot` was taken before compaction runs, so it
+        // does not contain output SST objects. We "augment" the snapshot with output SST objects
+        // published into `state.sstables` to avoid panicking when looking them up.
+        let mut augmented_snapshot = snapshot.clone();
+        let mut missing_output_sst = false;
+        for sst_id in output_sst_ids {
+            if let Some(sst) = state.sstables.get(sst_id) {
+                augmented_snapshot.sstables.insert(*sst_id, Arc::clone(sst));
+            } else {
+                missing_output_sst = true;
+            }
+        }
+
         let (applied_state, files_to_remove) = self.compaction_controller.apply_compaction_result(
-            snapshot,
+            &augmented_snapshot,
             task,
             output_sst_ids,
-            false,
+            // Fallback: if output SSTs are missing, skip any sorting that requires SST objects.
+            missing_output_sst,
         );
 
         // Merge into the latest state.
@@ -225,7 +241,14 @@ impl LsmStorageInner {
                         .copied(),
                 );
             }
-            _ => unimplemented!(),
+            CompactionTask::Leveled(task) => {
+                sst_ids.extend(
+                    task.upper_level_sst_ids
+                        .iter()
+                        .chain(task.lower_level_sst_ids.iter())
+                        .copied(),
+                );
+            }
         }
         let sstables = {
             let state = self.state.read();
@@ -349,15 +372,16 @@ impl LsmStorageInner {
             let mut state = self.state.write();
             let mut new_state = (**state).clone();
 
+            // Publish output SST objects early so apply-logic can read their first/last keys.
+            // This is required by leveled compaction when it sorts SST ids by key range.
+            new_state
+                .sstables
+                .extend(sstables.iter().map(|sst| (sst.sst_id(), Arc::clone(sst))));
+
             // 1) Apply compaction changes (on the latest state to avoid dropping concurrently
             // flushed L0 tables).
             files_to_remove =
                 self.merge_compaction_result(&snapshot, &mut new_state, &task, &output_sst_ids);
-
-            // 2) Publish new SST objects.
-            new_state
-                .sstables
-                .extend(sstables.iter().map(|sst| (sst.sst_id(), Arc::clone(sst))));
 
             *state = Arc::new(new_state);
         }
