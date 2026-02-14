@@ -41,7 +41,7 @@ impl<T: AsRef<[u8]>> Key<T> {
         let min_len = self.len().min(other.len());
         let mut i = 0;
         while i < min_len {
-            if self.0.as_ref()[i] != other.0.as_ref()[i] {
+            if self.0.as_ref()[i] != other.0[i] {
                 break;
             }
             i += 1;

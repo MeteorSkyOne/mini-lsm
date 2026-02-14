@@ -134,7 +134,7 @@ impl StorageIterator for SstConcatIterator {
     fn is_valid(&self) -> bool {
         self.current
             .as_ref()
-            .map_or(false, |current| current.is_valid())
+            .is_some_and(|current| current.is_valid())
     }
 
     fn next(&mut self) -> Result<()> {
@@ -150,7 +150,7 @@ impl StorageIterator for SstConcatIterator {
         let exhausted = self
             .current
             .as_ref()
-            .map_or(true, |current| !current.is_valid());
+            .is_none_or(|current| !current.is_valid());
         if !exhausted {
             return Ok(());
         }

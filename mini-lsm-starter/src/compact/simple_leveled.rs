@@ -77,7 +77,7 @@ impl SimpleLeveledCompactionController {
                     return Some(SimpleLeveledCompactionTask {
                         upper_level: Some(upper_level),
                         upper_level_sst_ids: _snapshot.levels[upper_level - 1].1.clone(),
-                        lower_level: lower_level,
+                        lower_level,
                         lower_level_sst_ids: _snapshot.levels[lower_level - 1].1.clone(),
                         is_lower_level_bottom_level: lower_level == self.options.max_levels,
                     });

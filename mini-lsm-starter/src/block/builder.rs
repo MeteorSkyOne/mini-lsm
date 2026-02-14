@@ -47,7 +47,7 @@ impl BlockBuilder {
         let entry_size = 2 + key_len + 2 + value.len(); // key_len(u16) + key + value_len(u16) + value
         // footer len = 2(num_of_elements_len(u16))
         // Unless the first key-value pair exceeds the target block size, otherwise total size should be less than or equal to the target block size.
-        if self.offsets.len() > 0 && self.data.len() + entry_size + 2 > self.block_size {
+        if !self.offsets.is_empty() && self.data.len() + entry_size + 2 > self.block_size {
             return false;
         }
         let is_first = self.offsets.is_empty();

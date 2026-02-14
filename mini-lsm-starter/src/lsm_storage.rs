@@ -361,10 +361,10 @@ impl LsmStorageInner {
                     continue;
                 }
 
-                if let Some(bloom) = &sst.bloom {
-                    if !bloom.may_contain(farmhash::fingerprint32(_key)) {
-                        continue;
-                    }
+                if let Some(bloom) = &sst.bloom
+                    && !bloom.may_contain(farmhash::fingerprint32(_key))
+                {
+                    continue;
                 }
                 let iter = SsTableIterator::create_and_seek_to_key(
                     Arc::clone(sst),
@@ -413,9 +413,7 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        if let Err(e) = self.state.read().memtable.put(_key, _value) {
-            return Err(e);
-        }
+        self.state.read().memtable.put(_key, _value)?;
         if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
             let lock = self.state_lock.lock();
             if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
@@ -427,9 +425,7 @@ impl LsmStorageInner {
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        if let Err(e) = self.state.read().memtable.put(_key, b"") {
-            return Err(e);
-        }
+        self.state.read().memtable.put(_key, b"")?;
         if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
             let lock = self.state_lock.lock();
             if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
@@ -477,12 +473,12 @@ impl LsmStorageInner {
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
         let _state_lock = self.state_lock.lock();
-        let memtable_to_flush;
+
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
         };
-        memtable_to_flush = snapshot.imm_memtables.last();
+        let memtable_to_flush = snapshot.imm_memtables.last();
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
         memtable_to_flush
             .ok_or(anyhow::anyhow!("no imm memtables!"))?
@@ -655,11 +651,9 @@ impl LsmStorageInner {
 
         // Newest memtable first, then immutable memtables from latest to earliest.
         let mut iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
-        iters.push(Box::new(
-            snapshot.memtable.scan(_lower.clone(), _upper.clone()),
-        ));
+        iters.push(Box::new(snapshot.memtable.scan(_lower, _upper)));
         for mem in snapshot.imm_memtables.iter() {
-            iters.push(Box::new(mem.scan(_lower.clone(), _upper.clone())));
+            iters.push(Box::new(mem.scan(_lower, _upper)));
         }
         let mem_iter = MergeIterator::create(iters);
 

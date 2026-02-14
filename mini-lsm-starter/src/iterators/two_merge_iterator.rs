@@ -69,12 +69,10 @@ impl<
             } else {
                 self.b.key()
             }
+        } else if self.b.is_valid() {
+            self.b.key()
         } else {
-            if self.b.is_valid() {
-                self.b.key()
-            } else {
-                self.a.key()
-            }
+            self.a.key()
         }
     }
 
@@ -85,12 +83,10 @@ impl<
             } else {
                 self.b.value()
             }
+        } else if self.b.is_valid() {
+            self.b.value()
         } else {
-            if self.b.is_valid() {
-                self.b.value()
-            } else {
-                self.a.value()
-            }
+            self.a.value()
         }
     }
 
