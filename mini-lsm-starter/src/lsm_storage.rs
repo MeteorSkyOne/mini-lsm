@@ -36,11 +36,11 @@ use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::MemTable;
 use crate::mem_table::map_bound;
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -193,6 +193,14 @@ impl MiniLsm {
                 .join()
                 .map_err(|_| anyhow::anyhow!("flush thread panicked"))?;
         }
+
+        if !self.inner.state.read().memtable.is_empty() {
+            let state_lock_observer = self.inner.state_lock.lock();
+            self.inner.force_freeze_memtable(&state_lock_observer)?;
+        }
+        while !self.inner.state.read().imm_memtables.is_empty() {
+            self.inner.force_flush_next_imm_memtable()?;
+        }
         Ok(())
     }
 
@@ -292,7 +300,8 @@ impl LsmStorageInner {
         } else {
             std::fs::create_dir_all(path)?;
         }
-        let state = LsmStorageState::create(&options);
+        let mut state = LsmStorageState::create(&options);
+        let block_cache = Arc::new(BlockCache::new(1 << 20)); // 4GB block cache,
 
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
@@ -307,14 +316,82 @@ impl LsmStorageInner {
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
 
+        let manifest_path = path.join("MANIFEST");
+        let manifest;
+        let mut next_sst_id = 1;
+        if !manifest_path.exists() {
+            manifest = Manifest::create(manifest_path)?;
+        } else {
+            // recover manifest
+            let (m, records) = Manifest::recover(manifest_path)?;
+            manifest = m;
+            for record in records {
+                match record {
+                    ManifestRecord::Flush(sst_id) => {
+                        if compaction_controller.flush_to_l0() {
+                            state.l0_sstables.insert(0, sst_id);
+                        } else {
+                            state.levels.insert(0, (sst_id, vec![sst_id]));
+                        }
+                        next_sst_id = next_sst_id.max(sst_id);
+                    }
+                    ManifestRecord::NewMemtable(memtable_id) => {
+                        // TODO
+                        next_sst_id = next_sst_id.max(memtable_id);
+                    }
+                    ManifestRecord::Compaction(task, sst_ids) => {
+                        let (new_state, _) = compaction_controller
+                            .apply_compaction_result(&state, &task, &sst_ids, true);
+                        state = new_state;
+                        next_sst_id = next_sst_id.max(sst_ids.iter().max().copied().unwrap_or(0));
+                    }
+                }
+            }
+
+            for sst_id in state
+                .l0_sstables
+                .iter()
+                .chain(state.levels.iter().flat_map(|(_, files)| files.iter()))
+            {
+                let sst_path = Self::path_of_sst_static(path, *sst_id);
+                if sst_path.exists() {
+                    let sst = SsTable::open(
+                        *sst_id,
+                        Some(block_cache.clone()),
+                        FileObject::open(&sst_path)?,
+                    )?;
+                    state.sstables.insert(*sst_id, Arc::new(sst));
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "SST file not found: {}",
+                        sst_path.display()
+                    ));
+                }
+            }
+
+            // Sort SSTs on each level (only for leveled compaction)
+            if let CompactionController::Leveled(_) = &compaction_controller {
+                for (_id, ssts) in &mut state.levels {
+                    ssts.sort_by(|x, y| {
+                        state
+                            .sstables
+                            .get(x)
+                            .unwrap()
+                            .first_key()
+                            .cmp(state.sstables.get(y).unwrap().first_key())
+                    })
+                }
+            }
+        }
+
         let storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
             state_lock: Mutex::new(()),
             path: path.to_path_buf(),
-            block_cache: Arc::new(BlockCache::new(1024)),
-            next_sst_id: AtomicUsize::new(1),
+            block_cache,
+            next_sst_id: AtomicUsize::new(next_sst_id + 1),
             compaction_controller,
-            manifest: None,
+            manifest: Some(manifest),
             options: options.into(),
             mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
@@ -324,7 +401,20 @@ impl LsmStorageInner {
     }
 
     pub fn sync(&self) -> Result<()> {
-        unimplemented!()
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+
+        if self.options.enable_wal {
+            snapshot.memtable.sync_wal()?;
+            for imm in &snapshot.imm_memtables {
+                imm.sync_wal()?;
+            }
+        }
+
+        self.sync_dir()?;
+        Ok(())
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
@@ -472,7 +562,7 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        let _state_lock = self.state_lock.lock();
+        let state_lock = self.state_lock.lock();
 
         let snapshot = {
             let guard = self.state.read();
@@ -486,19 +576,27 @@ impl LsmStorageInner {
         let sst_id = self.next_sst_id();
         let sst_path = self.path_of_sst(sst_id);
         let sst = sst_builder.build(sst_id, Some(self.block_cache.clone()), sst_path)?;
+        let sst_id = sst.sst_id();
 
         let mut state = self.state.write();
         let mut new_state = (**state).clone();
         new_state.imm_memtables.pop();
         if !self.compaction_controller.flush_to_l0() {
-            new_state
-                .levels
-                .insert(0, (sst.sst_id(), vec![sst.sst_id()]));
+            new_state.levels.insert(0, (sst_id, vec![sst_id]));
         } else {
-            new_state.l0_sstables.insert(0, sst.sst_id());
+            new_state.l0_sstables.insert(0, sst_id);
         }
-        new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
+        new_state.sstables.insert(sst_id, Arc::new(sst));
         *state = Arc::new(new_state);
+
+        // Only persist manifest records (and the corresponding directory entry metadata) when a
+        // manifest is enabled.
+        if let Some(manifest) = self.manifest.as_ref() {
+            // Make sure the SST file creation is durable before writing the manifest record that
+            // references it (POSIX crash consistency).
+            self.sync_dir()?;
+            manifest.add_record(&state_lock, ManifestRecord::Flush(sst_id))?;
+        }
         Ok(())
     }
 

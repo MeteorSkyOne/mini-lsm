@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 mod leveled;
 mod simple_leveled;
 mod tiered;
@@ -34,6 +31,7 @@ use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::key::TS_ENABLED;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -311,19 +309,33 @@ impl LsmStorageInner {
         Ok(new_ssts)
     }
 
+    fn remove_ssts(&self, sst_ids: &[usize]) -> Result<()> {
+        for sst_id in sst_ids {
+            let path = self.path_of_sst(*sst_id);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("failed to remove sst file {}", path.display()));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn force_full_compaction(&self) -> Result<()> {
-        let ssts_to_compact = {
+        let (l0_sstables, l1_sstables) = {
             let state = self.state.read();
             (state.l0_sstables.clone(), state.levels[0].1.clone())
         };
         let new_ssts = self.compact(&CompactionTask::ForceFullCompaction {
-            l0_sstables: ssts_to_compact.0.clone(),
-            l1_sstables: ssts_to_compact.1.clone(),
+            l0_sstables: l0_sstables.clone(),
+            l1_sstables: l1_sstables.clone(),
         })?;
-        let ssts_to_compact = ssts_to_compact
-            .0
+        let ssts_to_compact = l0_sstables
             .iter()
-            .chain(ssts_to_compact.1.iter())
+            .chain(l1_sstables.iter())
             .copied()
             .collect::<Vec<_>>();
         {
@@ -339,17 +351,23 @@ impl LsmStorageInner {
                 .extend(new_ssts.iter().map(|sst| (sst.sst_id(), sst.clone())));
             *state = Arc::new(new_state);
         };
-        for sst in ssts_to_compact {
-            let path = self.path_of_sst(sst);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("failed to remove sst file {}", path.display()));
-                }
-            }
+
+        if let Some(manifest) = self.manifest.as_ref() {
+            // Ensure newly created SSTs are durable before writing the manifest record that
+            // references them.
+            self.sync_dir()?;
+            manifest.add_record(
+                &self.state_lock.lock(),
+                ManifestRecord::Compaction(
+                    CompactionTask::ForceFullCompaction {
+                        l0_sstables: l0_sstables.clone(),
+                        l1_sstables: l1_sstables.clone(),
+                    },
+                    new_ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>(),
+                ),
+            )?;
         }
+        self.remove_ssts(&ssts_to_compact)?;
         Ok(())
     }
 
@@ -388,17 +406,16 @@ impl LsmStorageInner {
 
         // Best-effort: delete old SST files after state update so readers won't observe missing
         // files for referenced tables.
-        for sst_id in files_to_remove {
-            let path = self.path_of_sst(sst_id);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("failed to remove sst file {}", path.display()));
-                }
-            }
+        if let Some(manifest) = self.manifest.as_ref() {
+            // Ensure newly created SSTs are durable before writing the manifest record that
+            // references them.
+            self.sync_dir()?;
+            manifest.add_record(
+                &self.state_lock.lock(),
+                ManifestRecord::Compaction(task, output_sst_ids),
+            )?;
         }
+        self.remove_ssts(&files_to_remove)?;
         Ok(())
     }
 
