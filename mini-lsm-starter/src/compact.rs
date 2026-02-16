@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
+#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
+
 mod leveled;
 mod simple_leveled;
 mod tiered;
@@ -29,7 +32,6 @@ pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredComp
 
 use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
-use crate::key::TS_ENABLED;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
@@ -272,29 +274,42 @@ impl LsmStorageInner {
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
         let mut new_ssts = Vec::<Arc<SsTable>>::new();
         let mut builder_has_entries = false;
+        // Avoid splitting entries with the same user key (ignoring ts) across different SSTs.
+        // Internal key order is (user_key asc, ts desc), so all versions of a user key are
+        // contiguous in the merge iterator.
+        let mut split_pending_key: Option<Vec<u8>> = None;
         while merge_iter.is_valid() {
             let key = merge_iter.key();
             let value = merge_iter.value();
 
+            // If we've exceeded the target size, only split when we reach a new user key.
+            if let Some(pending) = &split_pending_key {
+                if key.key_ref() != pending.as_slice() && builder_has_entries {
+                    let sst_id = self.next_sst_id();
+                    let sst_path = self.path_of_sst(sst_id);
+                    let new_sst = sst_builder
+                        .build(sst_id, Some(self.block_cache.clone()), sst_path)
+                        .with_context(|| format!("failed to build sst {sst_id}"))?;
+                    new_ssts.push(Arc::new(new_sst));
+                    sst_builder = SsTableBuilder::new(self.options.block_size);
+                    split_pending_key = None;
+                }
+            }
+
             // When compacting to the bottom level, we can safely drop tombstones if
             // timestamp is disabled (week 1 mode). With timestamp enabled, we must keep
             // historical versions.
-            if !TS_ENABLED && _task.compact_to_bottom_level() && value.is_empty() {
-                merge_iter.next()?;
-                continue;
-            }
+            // if !TS_ENABLED && _task.compact_to_bottom_level() && value.is_empty() {
+            //     merge_iter.next()?;
+            //     continue;
+            // }
 
             sst_builder.add(key, value);
             builder_has_entries = true;
-            if sst_builder.estimated_size() >= self.options.target_sst_size {
-                let sst_id = self.next_sst_id();
-                let sst_path = self.path_of_sst(sst_id);
-                let new_sst = sst_builder
-                    .build(sst_id, Some(self.block_cache.clone()), sst_path)
-                    .with_context(|| format!("failed to build sst {sst_id}"))?;
-                new_ssts.push(Arc::new(new_sst));
-                sst_builder = SsTableBuilder::new(self.options.block_size);
-                builder_has_entries = false;
+            if split_pending_key.is_none()
+                && sst_builder.estimated_size() >= self.options.target_sst_size
+            {
+                split_pending_key = Some(key.key_ref().to_vec());
             }
             merge_iter.next()?;
         }

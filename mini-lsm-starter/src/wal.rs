@@ -22,6 +22,8 @@ use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::key::{KeyBytes, KeySlice};
+
 pub struct Wal {
     file: Arc<Mutex<BufWriter<File>>>,
 }
@@ -40,7 +42,7 @@ impl Wal {
         })
     }
 
-    pub fn recover(_path: impl AsRef<Path>, _skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
+    pub fn recover(_path: impl AsRef<Path>, _skiplist: &SkipMap<KeyBytes, Bytes>) -> Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -62,7 +64,9 @@ impl Wal {
             if rbuf.remaining() < key_len + 2 {
                 bail!("truncated wal record (key)");
             }
-            let key = Bytes::copy_from_slice(&rbuf[..key_len]);
+            let key_data = Bytes::copy_from_slice(&rbuf[..key_len]);
+            let key_ts = rbuf.get_u64();
+            let key = KeyBytes::from_bytes_with_ts(key_data, key_ts);
             rbuf.advance(key_len);
 
             if rbuf.remaining() < 2 {
@@ -87,16 +91,16 @@ impl Wal {
         })
     }
 
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
+    pub fn put(&self, _key: KeySlice, _value: &[u8]) -> Result<()> {
         self.put_batch(&[(_key, _value)])
     }
 
     /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.
-    pub fn put_batch(&self, _data: &[(&[u8], &[u8])]) -> Result<()> {
+    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
         let mut file = self.file.lock();
         let mut buf = Vec::new();
         for (key, value) in _data {
-            let key_len_u16 = match u16::try_from(key.len()) {
+            let key_len_u16 = match u16::try_from(key.key_len()) {
                 Ok(v) => v,
                 Err(_) => bail!("key too large"),
             };
@@ -107,7 +111,8 @@ impl Wal {
 
             let start = buf.len();
             buf.put_u16(key_len_u16);
-            buf.put_slice(key);
+            buf.put_slice(key.key_ref());
+            buf.put_u64(key.ts());
             buf.put_u16(value_len_u16);
             buf.put_slice(value);
             let checksum = crc32fast::hash(&buf[start..]);

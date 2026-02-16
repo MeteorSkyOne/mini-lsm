@@ -34,7 +34,7 @@ use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::key::{KeySlice, TS_RANGE_BEGIN, TS_RANGE_END};
+use crate::key::{KeySlice, TS_DEFAULT, TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::MemTable;
@@ -433,7 +433,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: options.into(),
-            mvcc: None,
+            mvcc: Some(LsmMvccInner::new(0)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
 
@@ -451,86 +451,46 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        let snapshot = {
-            let guard = self.state.read();
-            Arc::clone(&guard)
-        };
-
-        let v = snapshot.memtable.get(_key);
-        if let Some(v) = v {
-            return if !v.is_empty() { Ok(Some(v)) } else { Ok(None) };
+        // After key-ts refactor, a single user key can have multiple internal versions
+        // (user_key asc, ts desc). `scan` will merge sources, pick the newest version per user key,
+        // and skip tombstones, which matches `get` semantics.
+        let iter = self.scan(Bound::Included(_key), Bound::Included(_key))?;
+        if iter.is_valid() && iter.key() == _key {
+            Ok(Some(Bytes::copy_from_slice(iter.value())))
+        } else {
+            Ok(None)
         }
-        for imm_memtable in &snapshot.imm_memtables {
-            let v = imm_memtable.get(_key);
-            if let Some(v) = v {
-                return if !v.is_empty() { Ok(Some(v)) } else { Ok(None) };
-            }
-        }
-
-        // L0 SSTs (latest to earliest).
-        if self.compaction_controller.flush_to_l0() {
-            for id in &snapshot.l0_sstables {
-                let Some(sst) = snapshot.sstables.get(id) else {
-                    continue;
-                };
-                // Fast range check based on key bytes only (ignoring timestamps).
-                if sst.first_key().key_ref() > _key || sst.last_key().key_ref() < _key {
-                    continue;
-                }
-
-                if let Some(bloom) = &sst.bloom
-                    && !bloom.may_contain(farmhash::fingerprint32(_key))
-                {
-                    continue;
-                }
-                let iter = SsTableIterator::create_and_seek_to_key(
-                    Arc::clone(sst),
-                    KeySlice::from_slice(_key, TS_RANGE_BEGIN),
-                )?;
-                if iter.is_valid() && iter.key().key_ref() == _key {
-                    return if !iter.value().is_empty() {
-                        Ok(Some(Bytes::copy_from_slice(iter.value())))
-                    } else {
-                        Ok(None)
-                    };
-                }
-            }
-        }
-
-        // Leveled SSTs (L1..Lmax), newer levels first.
-        for (_level, files) in &snapshot.levels {
-            for id in files {
-                let Some(sst) = snapshot.sstables.get(id) else {
-                    continue;
-                };
-                if sst.first_key().key_ref() > _key || sst.last_key().key_ref() < _key {
-                    continue;
-                }
-                let iter = SsTableIterator::create_and_seek_to_key(
-                    Arc::clone(sst),
-                    KeySlice::from_slice(_key, TS_RANGE_BEGIN),
-                )?;
-                if iter.is_valid() && iter.key().key_ref() == _key {
-                    return if !iter.value().is_empty() {
-                        Ok(Some(Bytes::copy_from_slice(iter.value())))
-                    } else {
-                        Ok(None)
-                    };
-                }
-            }
-        }
-
-        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
-    }
+    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        // If MVCC is enabled, assign a new commit ts under the global write lock.
+        // Otherwise fall back to the default ts (week 2 behavior).
+        let (_write_guard, ts) = if let Some(mvcc) = self.mvcc.as_ref() {
+            let guard = mvcc.write_lock.lock();
+            let ts = mvcc.latest_commit_ts() + 1;
+            (Some(guard), ts)
+        } else {
+            (None, TS_DEFAULT)
+        };
 
-    /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        self.state.read().memtable.put(_key, _value)?;
+        let mut data: Vec<(KeySlice<'_>, &[u8])> = Vec::with_capacity(batch.len());
+        for record in batch {
+            match record {
+                WriteBatchRecord::Put(key, value) => {
+                    data.push((KeySlice::from_slice(key.as_ref(), ts), value.as_ref()));
+                }
+                WriteBatchRecord::Del(key) => {
+                    data.push((KeySlice::from_slice(key.as_ref(), ts), b""));
+                }
+            }
+        }
+
+        self.state.read().memtable.put_batch(&data)?;
+        if let Some(mvcc) = self.mvcc.as_ref() {
+            mvcc.update_commit_ts(ts);
+        }
+
         if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
             let lock = self.state_lock.lock();
             if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
@@ -540,15 +500,15 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    /// Put a key-value pair into the storage by writing into the current memtable.
+    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
+        self.write_batch(&[WriteBatchRecord::Put(_key, _value)])?;
+        Ok(())
+    }
+
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        self.state.read().memtable.put(_key, b"")?;
-        if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
-            let lock = self.state_lock.lock();
-            if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
-                self.force_freeze_memtable(&lock)?;
-            }
-        }
+        self.write_batch(&[WriteBatchRecord::Del(_key)])?;
         Ok(())
     }
 
@@ -803,11 +763,30 @@ impl LsmStorageInner {
             Arc::clone(&guard)
         };
 
+        // Map user key bounds to internal (key, ts) bounds for memtable range scans.
+        //
+        // Internal key ordering is (user_key asc, ts desc). To faithfully represent user-key-only
+        // bounds:
+        // - lower Included(k): start from the smallest internal key for k => (k, TS_RANGE_BEGIN)
+        // - lower Excluded(k): start strictly after all versions of k => exclude (k, TS_RANGE_END)
+        // - upper Included(k): end at the largest internal key for k => (k, TS_RANGE_END)
+        // - upper Excluded(k): end strictly before any version of k => exclude (k, TS_RANGE_BEGIN)
+        let mem_lower = match &_lower {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(k) => Bound::Included(KeySlice::from_slice(k, TS_RANGE_BEGIN)),
+            Bound::Excluded(k) => Bound::Excluded(KeySlice::from_slice(k, TS_RANGE_END)),
+        };
+        let mem_upper = match &_upper {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(k) => Bound::Included(KeySlice::from_slice(k, TS_RANGE_END)),
+            Bound::Excluded(k) => Bound::Excluded(KeySlice::from_slice(k, TS_RANGE_BEGIN)),
+        };
+
         // Newest memtable first, then immutable memtables from latest to earliest.
         let mut iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
-        iters.push(Box::new(snapshot.memtable.scan(_lower, _upper)));
+        iters.push(Box::new(snapshot.memtable.scan(mem_lower, mem_upper)));
         for mem in snapshot.imm_memtables.iter() {
-            iters.push(Box::new(mem.scan(_lower, _upper)));
+            iters.push(Box::new(mem.scan(mem_lower, mem_upper)));
         }
         let mem_iter = MergeIterator::create(iters);
 
