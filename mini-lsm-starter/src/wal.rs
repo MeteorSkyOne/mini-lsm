@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::{Buf, BufMut, Bytes};
 use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
@@ -52,12 +52,36 @@ impl Wal {
         file.read_to_end(&mut buf)?;
         let mut rbuf: &[u8] = buf.as_slice();
         while rbuf.has_remaining() {
+            if rbuf.remaining() < 2 {
+                bail!("truncated wal record (key_len)");
+            }
+
+            // Save the slice starting at the record boundary so we can checksum it
+            // without reconstructing the record into a temporary Vec.
+            let before = rbuf;
+
             let key_len = rbuf.get_u16() as usize;
+            if rbuf.remaining() < key_len + 2 {
+                bail!("truncated wal record (key)");
+            }
             let key = Bytes::copy_from_slice(&rbuf[..key_len]);
             rbuf.advance(key_len);
+
+            if rbuf.remaining() < 2 {
+                bail!("truncated wal record (value_len)");
+            }
             let value_len = rbuf.get_u16() as usize;
+            if rbuf.remaining() < value_len + 4 {
+                bail!("truncated wal record (value/checksum)");
+            }
             let value = Bytes::copy_from_slice(&rbuf[..value_len]);
             rbuf.advance(value_len);
+
+            let record_len = before.len() - rbuf.len(); // excludes checksum
+            let checksum = rbuf.get_u32();
+            if checksum != crc32fast::hash(&before[..record_len]) {
+                bail!("checksum mismatch");
+            }
             _skiplist.insert(key, value);
         }
         Ok(Self {
@@ -75,10 +99,22 @@ impl Wal {
         let mut buf = Vec::new();
         for (key, value) in _data {
             let key: &[u8] = key.raw_ref();
-            buf.put_u16(key.len() as u16);
+            let key_len_u16 = match u16::try_from(key.len()) {
+                Ok(v) => v,
+                Err(_) => bail!("key too large"),
+            };
+            let value_len_u16 = match u16::try_from(value.len()) {
+                Ok(v) => v,
+                Err(_) => bail!("value too large"),
+            };
+
+            let start = buf.len();
+            buf.put_u16(key_len_u16);
             buf.put_slice(key);
-            buf.put_u16(value.len() as u16);
+            buf.put_u16(value_len_u16);
             buf.put_slice(value);
+            let checksum = crc32fast::hash(&buf[start..]);
+            buf.put_u32(checksum);
         }
         file.write_all(&buf)?;
         Ok(())

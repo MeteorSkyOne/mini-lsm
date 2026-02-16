@@ -57,13 +57,54 @@ impl Manifest {
             .context("failed to recover manifest")?;
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
-        let json = serde_json::Deserializer::from_slice(&buf);
-        let records = json
-            .into_iter::<ManifestRecord>()
-            .map(|record| {
-                record.map_err(|_| anyhow::anyhow!("Failed to deserialize manifest record"))
-            })
-            .collect::<Result<Vec<ManifestRecord>>>()?;
+        let mut offset = 0usize;
+        let mut records = Vec::new();
+        while offset < buf.len() {
+            let len_end = offset
+                .checked_add(8)
+                .context("manifest offset overflow while reading length")?;
+            let len_bytes = buf
+                .get(offset..len_end)
+                .context("manifest truncated while reading length")?;
+            let len = u64::from_be_bytes(
+                len_bytes
+                    .try_into()
+                    .context("manifest length must be 8 bytes")?,
+            ) as usize;
+            offset = len_end;
+
+            let record_end = offset
+                .checked_add(len)
+                .context("manifest offset overflow while reading record")?;
+            let record_bytes = buf
+                .get(offset..record_end)
+                .context("manifest truncated while reading record")?;
+            offset = record_end;
+
+            let checksum_end = offset
+                .checked_add(4)
+                .context("manifest offset overflow while reading checksum")?;
+            let checksum_bytes = buf
+                .get(offset..checksum_end)
+                .context("manifest truncated while reading checksum")?;
+            let expected_checksum = u32::from_be_bytes(
+                checksum_bytes
+                    .try_into()
+                    .context("manifest checksum must be 4 bytes")?,
+            );
+            offset = checksum_end;
+
+            let actual_checksum = crc32fast::hash(record_bytes);
+            if actual_checksum != expected_checksum {
+                return Err(anyhow::anyhow!(
+                    "manifest checksum mismatch: expected {expected_checksum}, got {actual_checksum}"
+                ));
+            }
+
+            let record: ManifestRecord = serde_json::from_slice(record_bytes)
+                .context("failed to deserialize manifest record")?;
+            records.push(record);
+        }
         Ok((
             Self {
                 file: Arc::new(Mutex::new(file)),
@@ -82,7 +123,12 @@ impl Manifest {
 
     pub fn add_record_when_init(&self, _record: ManifestRecord) -> Result<()> {
         let mut lock = self.file.lock();
-        lock.write_all(&serde_json::to_vec(&_record)?)?;
+        let record = serde_json::to_vec(&_record)?;
+        let len = record.len() as u64;
+        let checksum = crc32fast::hash(&record);
+        lock.write_all(&len.to_be_bytes())?;
+        lock.write_all(&record)?;
+        lock.write_all(&checksum.to_be_bytes())?;
         lock.sync_all()?;
         Ok(())
     }

@@ -23,7 +23,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 pub use builder::SsTableBuilder;
 use bytes::{Buf, BufMut, Bytes};
 pub use iterator::SsTableIterator;
@@ -152,51 +152,94 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        // Read the last two u32 values as the meta offset and bloom offset (little-endian).
+        // Meta section layout:
+        // | meta block data | meta checksum | meta block offset | bloom filter | bloom checksum | bloom filter offset |
+        // |    varlen       |     u32       |        u32        |    varlen    |      u32       |        u32          |
+        //
+        // - Offsets are little-endian u32.
+        // - Checksums are u32 written with `BufMut::put_u32` (big-endian).
         let file_size = file.size();
-        if file_size < 8 {
+        if file_size < 20 {
             return Err(anyhow::anyhow!(
                 "sstable file too small: {} bytes",
                 file_size
             ));
         }
+
+        // Footer: [bloom_checksum (4 bytes BE)] [bloom_offset (4 bytes LE)]
         let footer = file.read(file_size - 8, 8)?;
         let footer_bytes: [u8; 8] = footer
             .as_slice()
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid sstable footer length"))?;
-        let block_meta_offset_u32 = u32::from_le_bytes(
-            footer_bytes[0..4]
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("invalid block meta offset encoding"))?,
-        ) as u64;
+        let bloom_checksum_bytes: [u8; 4] = footer_bytes[0..4]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid bloom checksum encoding"))?;
         let bloom_offset_u32 = u32::from_le_bytes(
             footer_bytes[4..8]
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("invalid bloom offset encoding"))?,
         ) as u64;
-        if block_meta_offset_u32 > file_size - 8 || bloom_offset_u32 > file_size - 8 {
-            return Err(anyhow::anyhow!(
-                "invalid offsets meta {} bloom {} (file size {})",
-                block_meta_offset_u32,
+        if bloom_offset_u32 > file_size - 8 {
+            bail!(
+                "invalid bloom offset {} (file size {})",
                 bloom_offset_u32,
                 file_size
-            ));
+            );
         }
-        let block_meta_offset = block_meta_offset_u32 as usize;
         let bloom_offset = bloom_offset_u32 as usize;
-        if bloom_offset < block_meta_offset {
-            return Err(anyhow::anyhow!(
-                "bloom offset {} before block meta offset {}",
-                bloom_offset,
-                block_meta_offset
-            ));
+        if bloom_offset < 8 {
+            bail!("invalid bloom offset {} (too small)", bloom_offset);
         }
 
-        let mut block_meta_buf = Bytes::from(file.read(
-            block_meta_offset as u64,
-            bloom_offset as u64 - block_meta_offset as u64,
-        )?);
+        // Decode bloom filter if present and verify checksum.
+        let bloom_len = file_size as usize - bloom_offset - 8;
+        let bloom_buf = file.read(bloom_offset as u64, bloom_len as u64)?;
+        let bloom_checksum_now = crc32fast::hash(&bloom_buf).to_be_bytes();
+        if bloom_checksum_now != bloom_checksum_bytes {
+            bail!("bloom checksum mismatched");
+        }
+        let bloom = if bloom_len > 0 {
+            Some(Bloom::decode(&bloom_buf)?)
+        } else {
+            None
+        };
+
+        // Immediately before bloom filter data: [meta_checksum (4 bytes BE)] [meta_offset (4 bytes LE)]
+        let meta_footer = file.read(bloom_offset as u64 - 8, 8)?;
+        let meta_footer_bytes: [u8; 8] = meta_footer
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid meta footer length"))?;
+        let meta_checksum_bytes: [u8; 4] = meta_footer_bytes[0..4]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid meta checksum encoding"))?;
+        let block_meta_offset_u32 = u32::from_le_bytes(
+            meta_footer_bytes[4..8]
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid block meta offset encoding"))?,
+        ) as u64;
+        if block_meta_offset_u32 > (bloom_offset as u64).saturating_sub(8) {
+            bail!(
+                "invalid block meta offset {} (bloom offset {})",
+                block_meta_offset_u32,
+                bloom_offset
+            );
+        }
+        let block_meta_offset = block_meta_offset_u32 as usize;
+        let meta_len = (bloom_offset - 8)
+            .checked_sub(block_meta_offset)
+            .ok_or(anyhow::anyhow!("invalid meta section length"))?;
+        if meta_len < 4 {
+            bail!("meta section too small: {} bytes", meta_len);
+        }
+        let meta_buf = file.read(block_meta_offset as u64, meta_len as u64)?;
+        let meta_checksum_now = crc32fast::hash(&meta_buf).to_be_bytes();
+        if meta_checksum_now != meta_checksum_bytes {
+            bail!("meta checksum mismatched");
+        }
+
+        let mut block_meta_buf = Bytes::from(meta_buf);
         let block_meta = BlockMeta::decode_block_meta(&mut block_meta_buf);
         let first_key = KeyBytes::from_bytes(Bytes::from(
             block_meta
@@ -214,15 +257,6 @@ impl SsTable {
                 .raw_ref()
                 .to_vec(),
         ));
-
-        // Decode bloom filter if present.
-        let bloom_len = file_size as usize - bloom_offset - 8;
-        let bloom = if bloom_len > 0 {
-            let bloom_buf = file.read(bloom_offset as u64, bloom_len as u64)?;
-            Some(Bloom::decode(&bloom_buf)?)
-        } else {
-            None
-        };
 
         Ok(Self {
             file,
@@ -265,7 +299,12 @@ impl SsTable {
         } else {
             self.block_meta[block_idx + 1].offset - meta.offset
         };
-        let data = self.file.read(meta.offset as u64, data_len as u64)?;
+        let data = self.file.read(meta.offset as u64, data_len as u64 - 4)?;
+        let real_checksum = self.file.read((meta.offset + data_len) as u64 - 4, 4)?;
+        let now_checksum = crc32fast::hash(&data[..data_len - 4]).to_be_bytes();
+        if real_checksum != now_checksum {
+            bail!("block checksum mismatched");
+        }
         Ok(Arc::new(Block::decode(&data)))
     }
 

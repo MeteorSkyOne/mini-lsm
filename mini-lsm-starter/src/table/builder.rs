@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
+use bytes::BufMut;
 
 use super::{BlockMeta, SsTable, bloom::Bloom};
 use crate::{
@@ -54,7 +55,10 @@ impl SsTableBuilder {
         let offset = self.data.len();
         let first_key = old_builder.first_key().raw_ref().to_vec();
         let last_key = self.last_key.clone();
-        self.data.extend_from_slice(&old_builder.build().encode());
+        let block_data = old_builder.build().encode();
+        let checksum = crc32fast::hash(&block_data);
+        self.data.extend_from_slice(&block_data);
+        self.data.put_u32(checksum);
         self.meta.push(BlockMeta {
             offset,
             first_key: KeyVec::from_vec(first_key).into_key_bytes(),
@@ -96,6 +100,9 @@ impl SsTableBuilder {
     }
 
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.
+    /// metablock layout:
+    // | meta block data | meta checksum | meta block offset | bloom filter | bloom checksum | bloom filter offset |
+    // |    varlen       |     u32       |        u32        |    varlen    |      u32       |        u32          |
     pub fn build(
         mut self,
         id: usize,
@@ -106,32 +113,42 @@ impl SsTableBuilder {
             self.flush_current_block();
         }
 
-        let mut buf = Vec::new();
-        BlockMeta::encode_block_meta(&self.meta, &mut buf);
         if self.data.len() > u32::MAX as usize {
             return Err(anyhow::anyhow!(
                 "sstable too large: data section {} bytes",
                 self.data.len()
             ));
         }
+        let mut meta_buf = Vec::new();
+        BlockMeta::encode_block_meta(&self.meta, &mut meta_buf);
+        let meta_checksum = crc32fast::hash(&meta_buf);
         let block_meta_offset = self.data.len() as u32;
-        self.data.extend_from_slice(&buf);
+        self.data.extend_from_slice(&meta_buf);
+        self.data.put_u32(meta_checksum);
+        self.data
+            .extend_from_slice(&block_meta_offset.to_le_bytes());
 
         // Build bloom filter from all keys in this SSTable.
         let mut bloom = None;
         let bloom_offset = self.data.len() as u32;
+        let mut bloom_buf = Vec::new();
         if !self.key_hashes.is_empty() {
             let bits_per_key = Bloom::bloom_bits_per_key(self.key_hashes.len(), 0.01);
             let built_bloom = Bloom::build_from_key_hashes(&self.key_hashes, bits_per_key);
-            let mut bloom_buf = Vec::new();
             built_bloom.encode(&mut bloom_buf);
-            self.data.extend_from_slice(&bloom_buf);
             bloom = Some(built_bloom);
         }
-
-        self.data
-            .extend_from_slice(&block_meta_offset.to_le_bytes());
+        self.data.extend_from_slice(&bloom_buf);
+        let bloom_checksum = crc32fast::hash(&bloom_buf);
+        self.data.put_u32(bloom_checksum);
         self.data.extend_from_slice(&bloom_offset.to_le_bytes());
+
+        if self.data.len() > u32::MAX as usize {
+            return Err(anyhow::anyhow!(
+                "sstable too large: total size {} bytes",
+                self.data.len()
+            ));
+        }
 
         let file = super::FileObject::create(path.as_ref(), self.data)?;
 
