@@ -63,12 +63,23 @@ impl MemTable {
 
     /// Create a new mem-table with WAL
     pub fn create_with_wal(_id: usize, _path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+        Ok(Self {
+            map: Arc::new(SkipMap::new()),
+            wal: Some(Wal::create(_path)?),
+            id: _id,
+            approximate_size: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     /// Create a memtable from WAL
     pub fn recover_from_wal(_id: usize, _path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+        let map = Arc::new(SkipMap::new());
+        Ok(Self {
+            wal: Some(Wal::recover(_path.as_ref(), &map)?),
+            map,
+            id: _id,
+            approximate_size: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     pub fn for_testing_put_slice(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -101,6 +112,9 @@ impl MemTable {
     /// In week 2, day 6, also flush the data to WAL.
     /// In week 3, day 5, modify the function to use the batch API.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
+        if let Some(ref wal) = self.wal {
+            wal.put(_key, _value)?;
+        }
         let map = Arc::clone(&self.map);
         map.insert(Bytes::copy_from_slice(_key), Bytes::copy_from_slice(_value));
         let size = self
@@ -115,6 +129,9 @@ impl MemTable {
 
     /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.
     pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
+        if let Some(ref wal) = self.wal {
+            wal.put_batch(_data)?;
+        }
         let map = Arc::clone(&self.map);
         for (key, value) in _data {
             map.insert(
