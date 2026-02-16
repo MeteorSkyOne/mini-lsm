@@ -3,4 +3,4 @@ description:
 alwaysApply: true
 ---
 
-do not use unwrap and after fix, do not run cargo test, just check grammar and logic
+do not use unwrap and after fix, and fix should follow the The principle of minimum coverage. Do not fix addtional test, just the test the user asked

@@ -34,7 +34,7 @@ use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::key::KeySlice;
+use crate::key::{KeySlice, TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::MemTable;
@@ -473,8 +473,8 @@ impl LsmStorageInner {
                 let Some(sst) = snapshot.sstables.get(id) else {
                     continue;
                 };
-                // Fast range check based on SST metadata.
-                if sst.first_key().raw_ref() > _key || sst.last_key().raw_ref() < _key {
+                // Fast range check based on key bytes only (ignoring timestamps).
+                if sst.first_key().key_ref() > _key || sst.last_key().key_ref() < _key {
                     continue;
                 }
 
@@ -485,9 +485,9 @@ impl LsmStorageInner {
                 }
                 let iter = SsTableIterator::create_and_seek_to_key(
                     Arc::clone(sst),
-                    KeySlice::from_slice(_key),
+                    KeySlice::from_slice(_key, TS_RANGE_BEGIN),
                 )?;
-                if iter.is_valid() && iter.key().raw_ref() == _key {
+                if iter.is_valid() && iter.key().key_ref() == _key {
                     return if !iter.value().is_empty() {
                         Ok(Some(Bytes::copy_from_slice(iter.value())))
                     } else {
@@ -503,14 +503,14 @@ impl LsmStorageInner {
                 let Some(sst) = snapshot.sstables.get(id) else {
                     continue;
                 };
-                if sst.first_key().raw_ref() > _key || sst.last_key().raw_ref() < _key {
+                if sst.first_key().key_ref() > _key || sst.last_key().key_ref() < _key {
                     continue;
                 }
                 let iter = SsTableIterator::create_and_seek_to_key(
                     Arc::clone(sst),
-                    KeySlice::from_slice(_key),
+                    KeySlice::from_slice(_key, TS_RANGE_BEGIN),
                 )?;
-                if iter.is_valid() && iter.key().raw_ref() == _key {
+                if iter.is_valid() && iter.key().key_ref() == _key {
                     return if !iter.value().is_empty() {
                         Ok(Some(Bytes::copy_from_slice(iter.value())))
                     } else {
@@ -687,12 +687,16 @@ impl LsmStorageInner {
     ) -> Result<SsTableIterator> {
         let iter = match lower {
             Bound::Unbounded => SsTableIterator::create_and_seek_to_first(sst)?,
-            Bound::Included(k) => {
-                SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(k))?
-            }
+            Bound::Included(k) => SsTableIterator::create_and_seek_to_key(
+                sst,
+                KeySlice::from_slice(k, TS_RANGE_BEGIN),
+            )?,
             Bound::Excluded(k) => {
-                let mut it = SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(k))?;
-                if it.is_valid() && it.key().raw_ref() == *k {
+                let mut it = SsTableIterator::create_and_seek_to_key(
+                    sst,
+                    KeySlice::from_slice(k, TS_RANGE_END),
+                )?;
+                while it.is_valid() && it.key().key_ref() == *k {
                     it.next()?;
                 }
                 it
@@ -714,8 +718,8 @@ impl LsmStorageInner {
                 .ok_or(anyhow::anyhow!("SST not found"))?;
 
             if !Self::sstable_overlaps_bounds(
-                sst.first_key().raw_ref(),
-                sst.last_key().raw_ref(),
+                sst.first_key().as_key_slice().key_ref(),
+                sst.last_key().as_key_slice().key_ref(),
                 lower,
                 upper,
             ) {
@@ -746,8 +750,8 @@ impl LsmStorageInner {
                     .get(id)
                     .ok_or(anyhow::anyhow!("SST not found"))?;
                 if !Self::sstable_overlaps_bounds(
-                    sst.first_key().raw_ref(),
-                    sst.last_key().raw_ref(),
+                    sst.first_key().as_key_slice().key_ref(),
+                    sst.last_key().as_key_slice().key_ref(),
                     lower,
                     upper,
                 ) {
@@ -762,15 +766,16 @@ impl LsmStorageInner {
 
             let iter = match lower {
                 Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(sstables)?,
-                Bound::Included(k) => {
-                    SstConcatIterator::create_and_seek_to_key(sstables, KeySlice::from_slice(k))?
-                }
+                Bound::Included(k) => SstConcatIterator::create_and_seek_to_key(
+                    sstables,
+                    KeySlice::from_slice(k, TS_RANGE_BEGIN),
+                )?,
                 Bound::Excluded(k) => {
                     let mut it = SstConcatIterator::create_and_seek_to_key(
                         sstables,
-                        KeySlice::from_slice(k),
+                        KeySlice::from_slice(k, TS_RANGE_END),
                     )?;
-                    if it.is_valid() && it.key().raw_ref() == *k {
+                    while it.is_valid() && it.key().key_ref() == *k {
                         it.next()?;
                     }
                     it

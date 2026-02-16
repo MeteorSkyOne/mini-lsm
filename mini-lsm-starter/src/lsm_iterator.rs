@@ -81,22 +81,37 @@ impl LsmIterator {
         match &self.end_bound {
             Bound::Unbounded => {}
             Bound::Included(end) => {
-                if self.inner.key().raw_ref() > end.as_ref() {
+                if self.inner.key().key_ref() > end.as_ref() {
                     self.reach_bound = true;
                 }
             }
             Bound::Excluded(end) => {
-                if self.inner.key().raw_ref() >= end.as_ref() {
+                if self.inner.key().key_ref() >= end.as_ref() {
                     self.reach_bound = true;
                 }
             }
         }
     }
 
+    /// Skip all remaining entries with the same key bytes as the current entry.
+    fn move_to_next_key(&mut self) -> Result<()> {
+        let current_key = self.inner.key().key_ref().to_vec();
+        loop {
+            self.advance_inner()?;
+            if !self.is_valid || self.reach_bound {
+                return Ok(());
+            }
+            if self.inner.key().key_ref() != current_key.as_slice() {
+                return Ok(());
+            }
+        }
+    }
+
     /// Skip entries whose value is empty (tombstones).
+    /// Also skips all older versions of the tombstoned key.
     fn skip_tombstones(&mut self) -> Result<()> {
         while !self.reach_bound && self.is_valid && self.inner.value().is_empty() {
-            self.advance_inner()?;
+            self.move_to_next_key()?;
         }
         Ok(())
     }
@@ -110,7 +125,7 @@ impl StorageIterator for LsmIterator {
     }
 
     fn key(&self) -> &[u8] {
-        self.inner.key().raw_ref()
+        self.inner.key().key_ref()
     }
 
     fn value(&self) -> &[u8] {
@@ -121,7 +136,7 @@ impl StorageIterator for LsmIterator {
         if self.reach_bound || !self.is_valid {
             return Ok(());
         }
-        self.advance_inner()?;
+        self.move_to_next_key()?;
         self.skip_tombstones()
     }
 

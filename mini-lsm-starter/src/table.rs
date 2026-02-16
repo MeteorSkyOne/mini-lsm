@@ -59,14 +59,16 @@ impl BlockMeta {
             buf.put_u32(meta.offset as u32);
 
             // Encode first key (length + bytes).
-            let first_key = meta.first_key.raw_ref();
-            buf.put_u16(first_key.len() as u16);
-            buf.extend_from_slice(first_key);
+            let first_key = &meta.first_key;
+            buf.put_u16(first_key.key_len() as u16);
+            buf.extend_from_slice(first_key.key_ref());
+            buf.put_u64(first_key.ts());
 
             // Encode last key (length + bytes).
-            let last_key = meta.last_key.raw_ref();
-            buf.put_u16(last_key.len() as u16);
-            buf.extend_from_slice(last_key);
+            let last_key = &meta.last_key;
+            buf.put_u16(last_key.key_len() as u16);
+            buf.extend_from_slice(last_key.key_ref());
+            buf.put_u64(last_key.ts());
         }
     }
 
@@ -79,13 +81,15 @@ impl BlockMeta {
             let first_key_len = buf.get_u16() as usize;
             let mut first_key = vec![0; first_key_len];
             buf.copy_to_slice(&mut first_key);
+            let first_key_ts = buf.get_u64();
             let last_key_len = buf.get_u16() as usize;
             let mut last_key = vec![0; last_key_len];
             buf.copy_to_slice(&mut last_key);
+            let last_key_ts = buf.get_u64();
             metas.push(BlockMeta {
                 offset,
-                first_key: KeyBytes::from_bytes(Bytes::from(first_key)),
-                last_key: KeyBytes::from_bytes(Bytes::from(last_key)),
+                first_key: KeyBytes::from_bytes_with_ts(Bytes::from(first_key), first_key_ts),
+                last_key: KeyBytes::from_bytes_with_ts(Bytes::from(last_key), last_key_ts),
             });
         }
         metas
@@ -241,22 +245,36 @@ impl SsTable {
 
         let mut block_meta_buf = Bytes::from(meta_buf);
         let block_meta = BlockMeta::decode_block_meta(&mut block_meta_buf);
-        let first_key = KeyBytes::from_bytes(Bytes::from(
+        let first_key = KeyBytes::from_bytes_with_ts(
+            Bytes::from(
+                block_meta
+                    .first()
+                    .ok_or(anyhow::anyhow!("empty block meta"))?
+                    .first_key
+                    .key_ref()
+                    .to_vec(),
+            ),
             block_meta
                 .first()
                 .ok_or(anyhow::anyhow!("empty block meta"))?
                 .first_key
-                .raw_ref()
-                .to_vec(),
-        ));
-        let last_key = KeyBytes::from_bytes(Bytes::from(
+                .ts(),
+        );
+        let last_key = KeyBytes::from_bytes_with_ts(
+            Bytes::from(
+                block_meta
+                    .last()
+                    .ok_or(anyhow::anyhow!("empty block meta"))?
+                    .last_key
+                    .key_ref()
+                    .to_vec(),
+            ),
             block_meta
                 .last()
                 .ok_or(anyhow::anyhow!("empty block meta"))?
                 .last_key
-                .raw_ref()
-                .to_vec(),
-        ));
+                .ts(),
+        );
 
         Ok(Self {
             file,

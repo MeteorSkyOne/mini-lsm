@@ -22,8 +22,6 @@ use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::key::KeySlice;
-
 pub struct Wal {
     file: Arc<Mutex<BufWriter<File>>>,
 }
@@ -90,15 +88,14 @@ impl Wal {
     }
 
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        self.put_batch(&[(KeySlice::from_slice(_key), _value)])
+        self.put_batch(&[(_key, _value)])
     }
 
     /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.
-    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
+    pub fn put_batch(&self, _data: &[(&[u8], &[u8])]) -> Result<()> {
         let mut file = self.file.lock();
         let mut buf = Vec::new();
         for (key, value) in _data {
-            let key: &[u8] = key.raw_ref();
             let key_len_u16 = match u16::try_from(key.len()) {
                 Ok(v) => v,
                 Err(_) => bail!("key too large"),

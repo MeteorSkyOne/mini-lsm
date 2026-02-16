@@ -18,7 +18,7 @@ use anyhow::Result;
 
 use super::StorageIterator;
 use crate::{
-    key::KeySlice,
+    key::{KeySlice, TS_DEFAULT},
     table::{SsTable, SsTableIterator},
 };
 
@@ -124,7 +124,9 @@ impl StorageIterator for SstConcatIterator {
     fn key(&self) -> KeySlice<'_> {
         self.current
             .as_ref()
-            .map_or(KeySlice::from_slice(&[]), |current| current.key())
+            .map_or(KeySlice::from_slice(&[], TS_DEFAULT), |current| {
+                current.key()
+            })
     }
 
     fn value(&self) -> &[u8] {

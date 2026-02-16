@@ -28,8 +28,8 @@ use crate::{
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
-    first_key: Vec<u8>,
-    last_key: Vec<u8>,
+    first_key: KeyVec,
+    last_key: KeyVec,
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
@@ -41,8 +41,8 @@ impl SsTableBuilder {
     pub fn new(block_size: usize) -> Self {
         Self {
             builder: BlockBuilder::new(block_size),
-            first_key: Vec::new(),
-            last_key: Vec::new(),
+            first_key: KeyVec::new(),
+            last_key: KeyVec::new(),
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
@@ -53,7 +53,7 @@ impl SsTableBuilder {
     fn flush_current_block(&mut self) {
         let old_builder = std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
         let offset = self.data.len();
-        let first_key = old_builder.first_key().raw_ref().to_vec();
+        let first_key = old_builder.first_key().clone();
         let last_key = self.last_key.clone();
         let block_data = old_builder.build().encode();
         let checksum = crc32fast::hash(&block_data);
@@ -61,8 +61,8 @@ impl SsTableBuilder {
         self.data.put_u32(checksum);
         self.meta.push(BlockMeta {
             offset,
-            first_key: KeyVec::from_vec(first_key).into_key_bytes(),
-            last_key: KeyVec::from_vec(last_key).into_key_bytes(),
+            first_key: first_key.into_key_bytes(),
+            last_key: last_key.into_key_bytes(),
         });
     }
 
@@ -72,14 +72,14 @@ impl SsTableBuilder {
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
         if self.first_key.is_empty() {
-            self.first_key = key.raw_ref().to_vec();
+            self.first_key = key.to_key_vec();
         }
 
-        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
+        self.key_hashes.push(farmhash::fingerprint32(key.key_ref()));
 
         if self.builder.add(key, value) {
             // successfully added to the current block
-            self.last_key = key.raw_ref().to_vec();
+            self.last_key = key.to_key_vec();
         } else {
             // current block is full, need to flush the current block and create a new one
             self.flush_current_block();
@@ -87,7 +87,7 @@ impl SsTableBuilder {
             if !self.builder.add(key, value) {
                 panic!("split block failed: single entry too large");
             };
-            self.last_key = key.raw_ref().to_vec();
+            self.last_key = key.to_key_vec();
         }
     }
 
@@ -158,8 +158,8 @@ impl SsTableBuilder {
             block_meta_offset: block_meta_offset as usize,
             id,
             block_cache,
-            first_key: KeyVec::from_vec(self.first_key).into_key_bytes(),
-            last_key: KeyVec::from_vec(self.last_key).into_key_bytes(),
+            first_key: self.first_key.into_key_bytes(),
+            last_key: self.last_key.into_key_bytes(),
             bloom,
             max_ts: 0,
         })

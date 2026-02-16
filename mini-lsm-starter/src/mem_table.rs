@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
@@ -128,21 +125,18 @@ impl MemTable {
     }
 
     /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.
-    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
+    pub fn put_batch(&self, _data: &[(&[u8], &[u8])]) -> Result<()> {
         if let Some(ref wal) = self.wal {
             wal.put_batch(_data)?;
         }
         let map = Arc::clone(&self.map);
         for (key, value) in _data {
-            map.insert(
-                Bytes::copy_from_slice(key.raw_ref()),
-                Bytes::copy_from_slice(value),
-            );
+            map.insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
             let size = self
                 .approximate_size
                 .load(std::sync::atomic::Ordering::Relaxed);
             self.approximate_size.store(
-                size + key.raw_ref().len() + value.len(),
+                size + key.len() + value.len(),
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
@@ -162,6 +156,7 @@ impl MemTable {
             map: self.map.clone(),
             iter_builder: |map| map.range((map_bound(_lower), map_bound(_upper))),
             item: (Bytes::new(), Bytes::new()),
+            id: self.id as u64,
         }
         .build();
         if iter.next().is_err() {
@@ -174,7 +169,7 @@ impl MemTable {
     pub fn flush(&self, _builder: &mut SsTableBuilder) -> Result<()> {
         for entry in self.map.iter() {
             _builder.add(
-                KeySlice::from_slice(entry.key().as_ref()),
+                KeySlice::from_slice(entry.key().as_ref(), self.id as u64),
                 entry.value().as_ref(),
             );
         }
@@ -213,6 +208,8 @@ pub struct MemTableIterator {
     iter: SkipMapRangeIter<'this>,
     /// Stores the current key-value pair.
     item: (Bytes, Bytes),
+    /// The memtable ID, used as the timestamp for keys.
+    id: u64,
 }
 
 impl StorageIterator for MemTableIterator {
@@ -223,7 +220,7 @@ impl StorageIterator for MemTableIterator {
     }
 
     fn key(&self) -> KeySlice<'_> {
-        KeySlice::from_slice(self.borrow_item().0.as_ref())
+        KeySlice::from_slice(self.borrow_item().0.as_ref(), *self.borrow_id())
     }
 
     fn is_valid(&self) -> bool {

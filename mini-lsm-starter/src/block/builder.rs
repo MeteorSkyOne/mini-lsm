@@ -43,14 +43,25 @@ impl BlockBuilder {
     /// You may find the `bytes::BufMut` trait useful for manipulating binary data.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
-        let key_len = key.raw_ref().len();
-        let entry_size = 2 + key_len + 2 + value.len(); // key_len(u16) + key + value_len(u16) + value
+        let key_len = key.key_len();
+        let is_first = self.offsets.is_empty();
+        // Actual encoded key bytes length (excluding the leading u16 length field):
+        // - first key: raw key bytes
+        // - later keys: prefix-compressed bytes: (u16 prefix_len + u16 rest_len + rest_bytes)
+        let encoded_key_len = if is_first {
+            key_len
+        } else {
+            let common_prefix_len = self.first_key.common_prefix_len(&key);
+            let rest_len = key_len.saturating_sub(common_prefix_len);
+            4 + rest_len
+        };
+        // key_len(u16) + key_bytes + ts(u64) + value_len(u16) + value_bytes
+        let entry_size = 2 + encoded_key_len + 8 + 2 + value.len();
         // footer len = 2(num_of_elements_len(u16))
         // Unless the first key-value pair exceeds the target block size, otherwise total size should be less than or equal to the target block size.
         if !self.offsets.is_empty() && self.data.len() + entry_size + 2 > self.block_size {
             return false;
         }
-        let is_first = self.offsets.is_empty();
         // append offset
         self.offsets.push(self.data.len() as u16);
 
@@ -59,20 +70,24 @@ impl BlockBuilder {
             // append key_len
             self.data.extend_from_slice(&(key_len as u16).to_le_bytes());
             // append key
-            self.data.extend_from_slice(key.raw_ref());
+            self.data.extend_from_slice(key.key_ref());
+            // append ts
+            self.data.extend_from_slice(&key.ts().to_le_bytes());
         } else {
             let common_prefix_len = self.first_key.common_prefix_len(&key);
-            let rest_len = key.len() - common_prefix_len;
+            let rest_len = key.key_len() - common_prefix_len;
             // new key = common_prefix + rest_len + key
             let mut new_key = KeyVec::new();
             new_key.append(&(common_prefix_len as u16).to_le_bytes());
             new_key.append(&(rest_len as u16).to_le_bytes());
-            new_key.append(&key.raw_ref()[common_prefix_len..]);
+            new_key.append(&key.key_ref()[common_prefix_len..]);
             // append key_len(u16 + u16 + rest_len)
             self.data
                 .extend_from_slice(&(4 + rest_len as u16).to_le_bytes());
             // append key
-            self.data.extend_from_slice(new_key.raw_ref());
+            self.data.extend_from_slice(new_key.key_ref());
+            // append ts
+            self.data.extend_from_slice(&key.ts().to_le_bytes());
         }
         // append value_len
         self.data

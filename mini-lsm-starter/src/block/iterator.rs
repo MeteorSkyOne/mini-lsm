@@ -88,11 +88,21 @@ impl BlockIterator {
             self.block.data[(key0_offset + 1) as usize],
         ]) as usize;
 
-        let value0_offset = key0_offset + 2 + key_len as u16;
-        self.key = KeyVec::from_vec(
+        let value0_offset = key0_offset + 2 + key_len as u16 + 8;
+        self.key = KeyVec::from_vec_with_ts(
             self.block.data
                 [(key0_offset + 2) as usize..(key0_offset + 2 + key_len as u16) as usize]
                 .to_vec(),
+            {
+                let ts_offset = value0_offset as usize - 8;
+                if ts_offset + 8 <= self.block.data.len() {
+                    let mut ts_arr = [0u8; 8];
+                    ts_arr.copy_from_slice(&self.block.data[ts_offset..ts_offset + 8]);
+                    u64::from_le_bytes(ts_arr)
+                } else {
+                    0
+                }
+            },
         );
         let value_len = u16::from_le_bytes([
             self.block.data[value0_offset as usize],
@@ -111,13 +121,13 @@ impl BlockIterator {
         }
         let prefix_len = u16::from_le_bytes([data[0], data[1]]) as usize;
         let rest_len = u16::from_le_bytes([data[2], data[3]]) as usize;
-        if prefix_len > self.first_key.len() {
+        if prefix_len > self.first_key.key_len() {
             return KeyVec::new();
         }
         if 4usize.saturating_add(rest_len) > data.len() {
             return KeyVec::new();
         }
-        let prefix = self.first_key.raw_ref()[..prefix_len].to_vec();
+        let prefix = self.first_key.key_ref()[..prefix_len].to_vec();
         let rest = data[4..4 + rest_len].to_vec();
         let mut key = KeyVec::new();
         key.append(&prefix);
@@ -138,7 +148,7 @@ impl BlockIterator {
             self.block.data[key_offset as usize],
             self.block.data[(key_offset + 1) as usize],
         ]) as usize;
-        let value_offset = key_offset + 2 + key_len as u16;
+        let value_offset = key_offset + 2 + key_len as u16 + 8;
         let value_len = u16::from_le_bytes([
             self.block.data[value_offset as usize],
             self.block.data[(value_offset + 1) as usize],
@@ -153,8 +163,24 @@ impl BlockIterator {
         if self.idx > 0 {
             // key decompression
             self.key = self.decompress_key(&data);
+            // Read timestamp for non-first keys
+            let ts_offset = key_offset as usize + 2 + key_len;
+            if ts_offset + 8 <= self.block.data.len() {
+                let mut ts_arr = [0u8; 8];
+                ts_arr.copy_from_slice(&self.block.data[ts_offset..ts_offset + 8]);
+                self.key.set_ts(u64::from_le_bytes(ts_arr));
+            }
         } else {
-            self.key = KeyVec::from_vec(data);
+            self.key = KeyVec::from_vec_with_ts(data, {
+                let ts_offset = value_offset as usize - 8;
+                if ts_offset + 8 <= self.block.data.len() {
+                    let mut ts_arr = [0u8; 8];
+                    ts_arr.copy_from_slice(&self.block.data[ts_offset..ts_offset + 8]);
+                    u64::from_le_bytes(ts_arr)
+                } else {
+                    0
+                }
+            });
         }
     }
 
@@ -182,7 +208,17 @@ impl BlockIterator {
                 let start = key0_offset + 2;
                 let end = start.saturating_add(key0_len);
                 if end <= self.block.data.len() {
-                    self.first_key = KeyVec::from_vec(self.block.data[start..end].to_vec());
+                    self.first_key =
+                        KeyVec::from_vec_with_ts(self.block.data[start..end].to_vec(), {
+                            let ts_offset = end as usize;
+                            if ts_offset + 8 <= self.block.data.len() {
+                                let mut ts_arr = [0u8; 8];
+                                ts_arr.copy_from_slice(&self.block.data[ts_offset..ts_offset + 8]);
+                                u64::from_le_bytes(ts_arr)
+                            } else {
+                                0
+                            }
+                        });
                 }
             }
         }
@@ -199,9 +235,25 @@ impl BlockIterator {
                     as usize;
             let mid_key_bytes = self.block.data[key_offset + 2..key_offset + 2 + key_len].to_vec();
             let mid_key = if mid > 0 {
-                self.decompress_key(&mid_key_bytes)
+                let mut k = self.decompress_key(&mid_key_bytes);
+                let ts_offset = key_offset + 2 + key_len;
+                if ts_offset + 8 <= self.block.data.len() {
+                    let mut ts_arr = [0u8; 8];
+                    ts_arr.copy_from_slice(&self.block.data[ts_offset..ts_offset + 8]);
+                    k.set_ts(u64::from_le_bytes(ts_arr));
+                }
+                k
             } else {
-                KeyVec::from_vec(mid_key_bytes)
+                KeyVec::from_vec_with_ts(mid_key_bytes, {
+                    let ts_offset = key_offset + 2 + key_len as usize;
+                    if ts_offset + 8 <= self.block.data.len() {
+                        let mut ts_arr = [0u8; 8];
+                        ts_arr.copy_from_slice(&self.block.data[ts_offset..ts_offset + 8]);
+                        u64::from_le_bytes(ts_arr)
+                    } else {
+                        0
+                    }
+                })
             };
 
             match mid_key.cmp(&target) {
@@ -225,11 +277,27 @@ impl BlockIterator {
         let data = self.block.data[key_offset + 2..key_offset + 2 + key_len].to_vec();
         if self.idx > 0 {
             self.key = self.decompress_key(&data);
+            let ts_offset = key_offset + 2 + key_len;
+            if ts_offset + 8 <= self.block.data.len() {
+                let mut ts_arr = [0u8; 8];
+                ts_arr.copy_from_slice(&self.block.data[ts_offset..ts_offset + 8]);
+                self.key.set_ts(u64::from_le_bytes(ts_arr));
+            }
         } else {
-            self.key = KeyVec::from_vec(data);
+            self.key = KeyVec::from_vec_with_ts(data, {
+                let ts_offset = key_offset + 2 + key_len as usize;
+                if ts_offset + 8 <= self.block.data.len() {
+                    let mut ts_arr = [0u8; 8];
+                    ts_arr.copy_from_slice(&self.block.data[ts_offset..ts_offset + 8]);
+                    u64::from_le_bytes(ts_arr)
+                } else {
+                    0
+                }
+            });
         }
 
-        let value_offset = key_offset + 2 + key_len;
+        // Skip ts (8 bytes) after key bytes.
+        let value_offset = key_offset + 2 + key_len + 8;
         let value_len = u16::from_le_bytes([
             self.block.data[value_offset],
             self.block.data[value_offset + 1],

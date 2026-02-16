@@ -17,7 +17,7 @@ use std::collections::BinaryHeap;
 
 use anyhow::Result;
 
-use crate::key::KeySlice;
+use crate::key::{KeySlice, TS_DEFAULT};
 
 use super::StorageIterator;
 
@@ -81,7 +81,9 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     fn key(&'_ self) -> KeySlice<'_> {
         self.current
             .as_ref()
-            .map_or(KeySlice::from_slice(&[]), |current| current.1.key())
+            .map_or(KeySlice::from_slice(&[], TS_DEFAULT), |current| {
+                current.1.key()
+            })
     }
 
     fn value(&self) -> &[u8] {
