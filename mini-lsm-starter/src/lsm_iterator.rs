@@ -37,17 +37,23 @@ pub struct LsmIterator {
     is_valid: bool,
     end_bound: Bound<Bytes>,
     reach_bound: bool,
+    read_ts: u64,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
+    pub(crate) fn new(
+        iter: LsmIteratorInner,
+        end_bound: Bound<Bytes>,
+        read_ts: u64,
+    ) -> Result<Self> {
         let mut iter = Self {
             is_valid: iter.is_valid(),
             inner: iter,
             end_bound,
             reach_bound: false,
+            read_ts,
         };
-        iter.skip_tombstones()?;
+        iter.skip_invisible_and_tombstones()?;
         // Ensure the initial position respects `end_bound` as well, so callers observing the
         // iterator without calling `next()` (e.g., checking `is_valid()` immediately) still see an
         // empty iterator when the range is known to be out of bound.
@@ -107,11 +113,25 @@ impl LsmIterator {
         }
     }
 
-    /// Skip entries whose value is empty (tombstones).
-    /// Also skips all older versions of the tombstoned key.
-    fn skip_tombstones(&mut self) -> Result<()> {
-        while !self.reach_bound && self.is_valid && self.inner.value().is_empty() {
-            self.move_to_next_key()?;
+    /// Skip entries that are not visible at `read_ts` and tombstones.
+    ///
+    /// Internal key ordering is (user_key asc, ts desc).
+    /// - If current version has `ts > read_ts`, it is invisible: advance to the next (older)
+    ///   internal version (likely the same user key with a smaller ts).
+    /// - If current visible version has an empty value, it is a tombstone: skip all versions of
+    ///   that user key.
+    fn skip_invisible_and_tombstones(&mut self) -> Result<()> {
+        while !self.reach_bound && self.is_valid {
+            let ts = self.inner.key().ts();
+            if ts > self.read_ts {
+                self.advance_inner()?;
+                continue;
+            }
+            if self.inner.value().is_empty() {
+                self.move_to_next_key()?;
+                continue;
+            }
+            break;
         }
         Ok(())
     }
@@ -137,7 +157,7 @@ impl StorageIterator for LsmIterator {
             return Ok(());
         }
         self.move_to_next_key()?;
-        self.skip_tombstones()
+        self.skip_invisible_and_tombstones()
     }
 
     fn num_active_iterators(&self) -> usize {

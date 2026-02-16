@@ -34,6 +34,7 @@ pub struct SsTableBuilder {
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
     key_hashes: Vec<u32>,
+    max_ts: u64,
 }
 
 impl SsTableBuilder {
@@ -47,6 +48,7 @@ impl SsTableBuilder {
             meta: Vec::new(),
             block_size,
             key_hashes: Vec::new(),
+            max_ts: 0,
         }
     }
 
@@ -76,6 +78,7 @@ impl SsTableBuilder {
         }
 
         self.key_hashes.push(farmhash::fingerprint32(key.key_ref()));
+        self.max_ts = self.max_ts.max(key.ts());
 
         if self.builder.add(key, value) {
             // successfully added to the current block
@@ -101,8 +104,8 @@ impl SsTableBuilder {
 
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.
     /// metablock layout:
-    // | meta block data | meta checksum | meta block offset | bloom filter | bloom checksum | bloom filter offset |
-    // |    varlen       |     u32       |        u32        |    varlen    |      u32       |        u32          |
+    // | meta block data | meta checksum | meta block offset | bloom filter | bloom checksum | bloom filter offset | max ts|
+    // |    varlen       |     u32       |        u32        |    varlen    |      u32       |        u32          |  u64  |
     pub fn build(
         mut self,
         id: usize,
@@ -142,6 +145,7 @@ impl SsTableBuilder {
         let bloom_checksum = crc32fast::hash(&bloom_buf);
         self.data.put_u32(bloom_checksum);
         self.data.extend_from_slice(&bloom_offset.to_le_bytes());
+        self.data.extend_from_slice(&self.max_ts.to_le_bytes());
 
         if self.data.len() > u32::MAX as usize {
             return Err(anyhow::anyhow!(
@@ -161,7 +165,7 @@ impl SsTableBuilder {
             first_key: self.first_key.into_key_bytes(),
             last_key: self.last_key.into_key_bytes(),
             bloom,
-            max_ts: 0,
+            max_ts: self.max_ts,
         })
     }
 

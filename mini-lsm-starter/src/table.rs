@@ -157,18 +157,25 @@ impl SsTable {
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         // Meta section layout:
-        // | meta block data | meta checksum | meta block offset | bloom filter | bloom checksum | bloom filter offset |
-        // |    varlen       |     u32       |        u32        |    varlen    |      u32       |        u32          |
+        // | meta block data | meta checksum | meta block offset | bloom filter | bloom checksum | bloom filter offset | max ts|
+        // |    varlen       |     u32       |        u32        |    varlen    |      u32       |        u32          |  u64  |
         //
         // - Offsets are little-endian u32.
         // - Checksums are u32 written with `BufMut::put_u32` (big-endian).
-        let file_size = file.size();
+        let mut file_size = file.size();
         if file_size < 20 {
             return Err(anyhow::anyhow!(
                 "sstable file too small: {} bytes",
                 file_size
             ));
         }
+        let max_ts = file.read(file_size - 8, 8)?;
+        let max_ts = u64::from_le_bytes(
+            max_ts
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid max ts encoding"))?,
+        );
+        file_size -= 8;
 
         // Footer: [bloom_checksum (4 bytes BE)] [bloom_offset (4 bytes LE)]
         let footer = file.read(file_size - 8, 8)?;
@@ -285,7 +292,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom,
-            max_ts: 0,
+            max_ts,
         })
     }
 
