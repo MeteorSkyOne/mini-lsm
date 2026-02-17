@@ -32,6 +32,7 @@ pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredComp
 
 use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::key::TS_ENABLED;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
@@ -274,17 +275,27 @@ impl LsmStorageInner {
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
         let mut new_ssts = Vec::<Arc<SsTable>>::new();
         let mut builder_has_entries = false;
+        let compact_to_bottom_level = _task.compact_to_bottom_level();
+        let watermark = TS_ENABLED.then(|| self.mvcc().watermark());
         // Avoid splitting entries with the same user key (ignoring ts) across different SSTs.
         // Internal key order is (user_key asc, ts desc), so all versions of a user key are
         // contiguous in the merge iterator.
         let mut split_pending_key: Option<Vec<u8>> = None;
+        let mut current_user_key: Option<Vec<u8>> = None;
+        let mut kept_version_at_or_below_watermark = false;
         while merge_iter.is_valid() {
             let key = merge_iter.key();
             let value = merge_iter.value();
+            let user_key = key.key_ref();
+
+            if current_user_key.as_deref() != Some(user_key) {
+                current_user_key = Some(user_key.to_vec());
+                kept_version_at_or_below_watermark = false;
+            }
 
             // If we've exceeded the target size, only split when we reach a new user key.
             if let Some(pending) = &split_pending_key {
-                if key.key_ref() != pending.as_slice() && builder_has_entries {
+                if user_key != pending.as_slice() && builder_has_entries {
                     let sst_id = self.next_sst_id();
                     let sst_path = self.path_of_sst(sst_id);
                     let new_sst = sst_builder
@@ -296,20 +307,37 @@ impl LsmStorageInner {
                 }
             }
 
-            // When compacting to the bottom level, we can safely drop tombstones if
-            // timestamp is disabled (week 1 mode). With timestamp enabled, we must keep
-            // historical versions.
-            // if !TS_ENABLED && _task.compact_to_bottom_level() && value.is_empty() {
-            //     merge_iter.next()?;
-            //     continue;
-            // }
+            // MVCC compaction rule:
+            // - keep all versions with ts > watermark.
+            // - for ts <= watermark, keep only the latest one per user key.
+            // - if the kept latest (<= watermark) is a tombstone and we compact to the
+            //   bottom level, drop the key entirely.
+            let keep_entry = if let Some(watermark) = watermark {
+                if key.ts() > watermark {
+                    true
+                } else if kept_version_at_or_below_watermark {
+                    false
+                } else {
+                    kept_version_at_or_below_watermark = true;
+                    !(compact_to_bottom_level && value.is_empty())
+                }
+            } else {
+                // When timestamp is disabled, we can safely drop tombstones only if
+                // compacting to the bottom level.
+                !(compact_to_bottom_level && value.is_empty())
+            };
+
+            if !keep_entry {
+                merge_iter.next()?;
+                continue;
+            }
 
             sst_builder.add(key, value);
             builder_has_entries = true;
             if split_pending_key.is_none()
                 && sst_builder.estimated_size() >= self.options.target_sst_size
             {
-                split_pending_key = Some(key.key_ref().to_vec());
+                split_pending_key = Some(user_key.to_vec());
             }
             merge_iter.next()?;
         }
