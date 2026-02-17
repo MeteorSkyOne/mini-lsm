@@ -21,7 +21,7 @@ use std::{
     },
 };
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
@@ -32,6 +32,7 @@ use crate::{
     lsm_iterator::{FusedIterator, LsmIterator},
     lsm_storage::{LsmStorageInner, WriteBatchRecord},
     mem_table::map_bound,
+    mvcc::CommittedTxnData,
 };
 
 pub struct Transaction {
@@ -47,6 +48,11 @@ impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         if self.committed.load(Ordering::SeqCst) {
             return Err(anyhow::anyhow!("cannot operate on committed txn!"));
+        }
+        if let Some(guard) = &self.key_hashes {
+            let mut guard = guard.lock();
+            let (_, read_set) = &mut *guard;
+            read_set.insert(farmhash::hash32(key));
         }
         if let Some(entry) = self.local_storage.get(&Bytes::copy_from_slice(key)) {
             if entry.value().is_empty() {
@@ -81,6 +87,11 @@ impl Transaction {
         if self.committed.load(Ordering::SeqCst) {
             return;
         }
+        if let Some(guard) = &self.key_hashes {
+            let mut guard = guard.lock();
+            let (write_set, _) = &mut *guard;
+            write_set.insert(farmhash::hash32(key));
+        }
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
     }
@@ -89,11 +100,33 @@ impl Transaction {
         if self.committed.load(Ordering::SeqCst) {
             return;
         }
+        if let Some(guard) = &self.key_hashes {
+            let mut guard = guard.lock();
+            let (_, write_set) = &mut *guard;
+            write_set.insert(farmhash::hash32(key));
+        }
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::new());
     }
 
     pub fn commit(&self) -> Result<()> {
+        let guard = self.inner.mvcc().commit_lock.lock();
+        let mut write_set = HashSet::new();
+        if let Some(guard) = &self.key_hashes {
+            let mut guard = guard.lock();
+            let (w, read_set) = &mut *guard;
+            write_set = std::mem::take(w);
+            if !write_set.is_empty() {
+                let commit_txns = self.inner.mvcc().committed_txns.lock();
+                for (_, txn_data) in commit_txns.range((self.read_ts + 1)..) {
+                    if !read_set.is_disjoint(&txn_data.key_hashes) {
+                        bail!("serializable check failed");
+                    }
+                }
+            }
+        }
+        let mut commit_txns = self.inner.mvcc().committed_txns.lock();
+
         let write_batch = self
             .local_storage
             .iter()
@@ -105,7 +138,17 @@ impl Transaction {
                 }
             })
             .collect::<Vec<_>>();
-        self.inner.write_batch(&write_batch)?;
+        let ts = self.inner.write_batch_inner(&write_batch)?;
+        commit_txns.insert(
+            ts,
+            CommittedTxnData {
+                key_hashes: write_set,
+                read_ts: self.read_ts,
+                commit_ts: ts,
+            },
+        );
+        let watermark = self.inner.mvcc().watermark();
+        commit_txns.retain(|_, txn_data| txn_data.commit_ts >= watermark);
         self.committed.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -164,12 +207,24 @@ pub struct TxnIterator {
 }
 
 impl TxnIterator {
+    fn add_to_read_set(&self) {
+        if !self.iter.is_valid() {
+            return;
+        }
+        if let Some(guard) = &self._txn.key_hashes {
+            let mut guard = guard.lock();
+            let (_, read_set) = &mut *guard;
+            read_set.insert(farmhash::hash32(self.iter.key()));
+        }
+    }
+
     pub fn create(
         txn: Arc<Transaction>,
         iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
     ) -> Result<Self> {
         let mut iter = Self { _txn: txn, iter };
         iter.skip_deletes()?;
+        iter.add_to_read_set();
         Ok(iter)
     }
 
@@ -201,7 +256,9 @@ impl StorageIterator for TxnIterator {
 
     fn next(&mut self) -> Result<()> {
         self.iter.next()?;
-        self.skip_deletes()
+        self.skip_deletes()?;
+        self.add_to_read_set();
+        Ok(())
     }
 
     fn num_active_iterators(&self) -> usize {

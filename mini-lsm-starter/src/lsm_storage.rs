@@ -471,7 +471,7 @@ impl LsmStorageInner {
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+    pub fn write_batch_inner<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<u64> {
         // If MVCC is enabled, assign a new commit ts under the global write lock.
         // Otherwise fall back to the default ts (week 2 behavior).
         let (_write_guard, ts) = if let Some(mvcc) = self.mvcc.as_ref() {
@@ -505,18 +505,54 @@ impl LsmStorageInner {
                 self.force_freeze_memtable(&lock)?;
             }
         }
+        Ok(ts)
+    }
+
+    /// Write a batch of data into the storage. Implement in week 2 day 7.
+    pub fn write_batch<T: AsRef<[u8]>>(
+        self: &Arc<Self>,
+        batch: &[WriteBatchRecord<T>],
+    ) -> Result<()> {
+        if self.options.serializable {
+            let txn = self.mvcc().new_txn(self.clone(), self.options.serializable);
+            for record in batch {
+                match record {
+                    WriteBatchRecord::Put(key, value) => {
+                        txn.put(key.as_ref(), value.as_ref());
+                    }
+                    WriteBatchRecord::Del(key) => {
+                        txn.delete(key.as_ref());
+                    }
+                }
+            }
+            txn.commit()?;
+        } else {
+            self.write_batch_inner(batch)?;
+        }
         Ok(())
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        self.write_batch(&[WriteBatchRecord::Put(_key, _value)])?;
+    pub fn put(self: &Arc<Self>, _key: &[u8], _value: &[u8]) -> Result<()> {
+        if self.options.serializable {
+            let txn = self.mvcc().new_txn(self.clone(), self.options.serializable);
+            txn.put(_key, _value);
+            txn.commit()?;
+        } else {
+            self.write_batch_inner(&[WriteBatchRecord::Put(_key, _value)])?;
+        }
         Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        self.write_batch(&[WriteBatchRecord::Del(_key)])?;
+    pub fn delete(self: &Arc<Self>, _key: &[u8]) -> Result<()> {
+        if self.options.serializable {
+            let txn = self.mvcc().new_txn(self.clone(), self.options.serializable);
+            txn.delete(_key);
+            txn.commit()?;
+        } else {
+            self.write_batch_inner(&[WriteBatchRecord::Del(_key)])?;
+        }
         Ok(())
     }
 
