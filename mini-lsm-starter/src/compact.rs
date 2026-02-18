@@ -33,7 +33,7 @@ pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredComp
 use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::key::TS_ENABLED;
-use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::lsm_storage::{CompactionFilter, LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -309,7 +309,7 @@ impl LsmStorageInner {
 
             // MVCC compaction rule:
             // - keep all versions with ts > watermark.
-            // - for ts <= watermark, keep only the latest one per user key.
+            // - for ts <= watermark, keep only the latest one per user key (if not filter matched).
             // - if the kept latest (<= watermark) is a tombstone and we compact to the
             //   bottom level, drop the key entirely.
             let keep_entry = if let Some(watermark) = watermark {
@@ -320,6 +320,13 @@ impl LsmStorageInner {
                 } else {
                     kept_version_at_or_below_watermark = true;
                     !(compact_to_bottom_level && value.is_empty())
+                        && self
+                            .compaction_filters
+                            .lock()
+                            .iter()
+                            .all(|filter| match filter {
+                                CompactionFilter::Prefix(prefix) => !user_key.starts_with(prefix),
+                            })
                 }
             } else {
                 // When timestamp is disabled, we can safely drop tombstones only if
